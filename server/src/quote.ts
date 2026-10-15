@@ -1,0 +1,155 @@
+import type { Address, PublicClient } from "viem";
+import { curveAbi } from "./chain.js";
+
+const BPS = 10_000n;
+
+const ceilDiv = (a: bigint, b: bigint): bigint => (a + b - 1n) / b;
+
+/** Constant product in the curve's own integer order (no fee applied here). */
+function amountOut(inAmount: bigint, reserveIn: bigint, reserveOut: bigint): bigint {
+  return (inAmount * reserveOut) / (reserveIn + inAmount);
+}
+
+function amountIn(outAmount: bigint, reserveIn: bigint, reserveOut: bigint): bigint {
+  return (outAmount * reserveIn) / (reserveOut - outAmount) + 1n;
+}
+
+export interface CurveState {
+  isNativeQuote: boolean;
+  pairToken: Address;
+  quoteReserve: bigint;
+  tokenReserve: bigint;
+  sellable: bigint;
+  feeBps: bigint;
+  creatorTaxBps: bigint;
+  /** Opening snipe tax for this specific recipient, in bps. 0 when exempt. */
+  snipeTaxBps: bigint;
+  graduated: boolean;
+  readyToGraduate: boolean;
+}
+
+export async function readCurveState(
+  client: PublicClient,
+  curve: Address,
+  recipient: Address,
+): Promise<CurveState> {
+  const read = (functionName: string, args?: readonly unknown[]) =>
+    client.readContract({ address: curve, abi: curveAbi, functionName: functionName as never, args: args as never });
+
+  const [isNativeQuote, pairToken, reserves, sellable, feeBps, creatorTaxBps, rawSnipe, graduated, ready] =
+    await Promise.all([
+      read("isNativeQuote"),
+      read("pairToken"),
+      read("getReserves"),
+      read("sellableTokens"),
+      read("feeBps"),
+      read("creatorTaxBps"),
+      read("currentSnipeTaxBps", [recipient]),
+      read("graduated"),
+      read("readyToGraduate"),
+    ]);
+
+  const [quoteReserve, tokenReserve] = reserves as [bigint, bigint];
+
+  return {
+    isNativeQuote: isNativeQuote as boolean,
+    pairToken: pairToken as Address,
+    quoteReserve,
+    tokenReserve,
+    sellable: sellable as bigint,
+    feeBps: feeBps as bigint,
+    creatorTaxBps: creatorTaxBps as bigint,
+    snipeTaxBps: rawSnipe as bigint,
+    graduated: graduated as boolean,
+    readyToGraduate: ready as boolean,
+  };
+}
+
+export interface BuyQuote {
+  tokensOut: bigint;
+  spent: bigint;
+  refund: bigint;
+  /** Snipe tax actually applied after the protocol's own cap. */
+  appliedSnipeTaxBps: bigint;
+}
+
+/**
+ * Quote a curve buy using the protocol's own integer order. Mirrors the
+ * reference implementation in the pons v2 docs so the result matches what
+ * the trade settles at when nothing moves in between.
+ */
+export function quoteCurveBuy(quoteIn: bigint, state: CurveState): BuyQuote {
+  const { feeBps, creatorTaxBps, quoteReserve, tokenReserve, sellable } = state;
+
+  // The snipe tax is capped so the buyer always nets at least 1% of spend.
+  let snipeBps = state.snipeTaxBps;
+  if (snipeBps > 0n) {
+    const maxSnipeBps = BPS - feeBps - creatorTaxBps - 100n;
+    if (snipeBps > maxSnipeBps) snipeBps = maxSnipeBps;
+  }
+
+  // Every fee comes off the input before the curve prices the trade.
+  let spent = quoteIn;
+  const fee = (spent * feeBps) / BPS;
+  const tax = (spent * creatorTaxBps) / BPS;
+  const snipeTax = (spent * snipeBps) / BPS;
+  let tokensOut = amountOut(spent - fee - tax - snipeTax, quoteReserve, tokenReserve);
+
+  // A buy that would cross the reserved allocation fills to the edge and is
+  // repriced from the token side, refunding the difference.
+  if (tokensOut > sellable) {
+    tokensOut = sellable;
+    const net = amountIn(sellable, quoteReserve, tokenReserve);
+    const grossed = ceilDiv(net * BPS, BPS - feeBps - creatorTaxBps - snipeBps);
+    spent = grossed < quoteIn ? grossed : quoteIn;
+  }
+
+  return {
+    tokensOut,
+    spent,
+    refund: quoteIn - spent,
+    appliedSnipeTaxBps: snipeBps,
+  };
+}
+
+/** Apply a slippage tolerance (bps) to derive a minimum-output bound. */
+export function withSlippage(tokensOut: bigint, slippageBps: number): bigint {
+  const bound = BigInt(Math.max(0, Math.min(9999, Math.round(slippageBps))));
+  return (tokensOut * (BPS - bound)) / BPS;
+}
+
+/**
+ * Quote the first buy of a brand-new launch, before its curve exists.
+ * The curve starts at (phantomQuote, supply) and holds back
+ * `supply * phantomQuote / (phantomQuote + threshold)` for the pool, so
+ * `sellable = supply - reserved`.
+ */
+export function quoteFreshLaunch(params: {
+  supply: bigint;
+  phantomQuote: bigint;
+  graduationThreshold: bigint;
+  curveFeeBps: bigint;
+  creatorTaxBps: bigint;
+  quoteIn: bigint;
+}): BuyQuote & { sellable: bigint } {
+  const { supply, phantomQuote, graduationThreshold, curveFeeBps, creatorTaxBps, quoteIn } = params;
+  const reserved = (supply * phantomQuote) / (phantomQuote + graduationThreshold);
+  const sellable = supply - reserved;
+
+  const state: CurveState = {
+    isNativeQuote: true,
+    pairToken: "0x0000000000000000000000000000000000000000",
+    quoteReserve: phantomQuote,
+    tokenReserve: supply,
+    sellable,
+    feeBps: curveFeeBps,
+    creatorTaxBps,
+    snipeTaxBps: 0n,
+    graduated: false,
+    readyToGraduate: false,
+  };
+
+  return { ...quoteCurveBuy(quoteIn, state), sellable };
+}
+
+export { BPS };

@@ -1,0 +1,22 @@
+# deps
+node_modules/
+.npm-cache/
+
+# build output
+web/dist/
+server/dist/
+
+# secrets & runtime data (NEVER commit these)
+.env
+.env.local
+server/data/
+
+# editor / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# logs
+*.log
+npm-debug.log*
