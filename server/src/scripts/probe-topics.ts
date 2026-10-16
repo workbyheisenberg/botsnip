@@ -1,6 +1,8 @@
 import { PONS, publicClient, tokenLaunchedEvent } from "../chain.js";
 import { installDohResolver } from "../doh.js";
+import { loadDB } from "../store.js";
 
+loadDB();
 installDohResolver();
 
 const head = await publicClient.getBlockNumber();

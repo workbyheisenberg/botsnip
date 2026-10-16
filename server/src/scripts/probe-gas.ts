@@ -1,7 +1,9 @@
 import { formatGwei } from "viem";
 import { publicClient } from "../chain.js";
 import { installDohResolver } from "../doh.js";
+import { loadDB } from "../store.js";
 
+loadDB();
 installDohResolver();
 
 const SAMPLES = 20;

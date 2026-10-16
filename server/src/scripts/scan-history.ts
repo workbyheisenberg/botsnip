@@ -1,5 +1,6 @@
 import { PONS, publicClient, tokenLaunchedEvent } from "../chain.js";
 import { installDohResolver } from "../doh.js";
+import { loadDB } from "../store.js";
 import { config } from "../config.js";
 
 /**
@@ -8,6 +9,7 @@ import { config } from "../config.js";
  *
  *   npm --workspace server run scan-history -- <fromBlock> <toBlock>
  */
+loadDB();
 installDohResolver();
 
 const args = process.argv.slice(2);

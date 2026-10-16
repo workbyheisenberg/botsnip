@@ -1,8 +1,10 @@
 import { createPublicClient, http } from "viem";
 import { effectiveRpcUrl, robinhoodChain } from "../chain.js";
 import { installDohResolver } from "../doh.js";
-import { readCurveState } from "../quote.js";
+import { loadDB } from "../store.js";
+import { quoteCurveBuy, readCurveState } from "../quote.js";
 
+loadDB(); // scripts must load the saved settings to see the configured RPC
 installDohResolver();
 
 const url = effectiveRpcUrl();
