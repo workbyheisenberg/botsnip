@@ -14,6 +14,10 @@ export function SettingsPage({ onLogout }: { onLogout: () => void }) {
   const [botToken, setBotToken] = useState("");
   const [chatId, setChatId] = useState("");
   const [telegramMsg, setTelegramMsg] = useState<string | null>(null);
+  const [priorityFee, setPriorityFee] = useState("");
+  const [gasLimit, setGasLimit] = useState("");
+  const [rpcUrl, setRpcUrl] = useState("");
+  const [wsUrl, setWsUrl] = useState("");
 
   useEffect(() => {
     if (!state) return;
@@ -21,11 +25,19 @@ export function SettingsPage({ onLogout }: { onLogout: () => void }) {
     setSlippage(String(state.settings.slippageBps / 100));
     setMaxTax(String(state.settings.maxSnipeTaxBps / 100));
     setChatId(state.settings.telegramChatId);
+    setPriorityFee(state.settings.priorityFeeGwei);
+    setGasLimit(state.settings.gasLimit);
+    setRpcUrl(state.settings.rpcUrl);
+    setWsUrl(state.settings.wsUrl);
   }, [
     state?.settings.buyAmountEth,
     state?.settings.slippageBps,
     state?.settings.maxSnipeTaxBps,
     state?.settings.telegramChatId,
+    state?.settings.priorityFeeGwei,
+    state?.settings.gasLimit,
+    state?.settings.rpcUrl,
+    state?.settings.wsUrl,
   ]);
 
   if (!state) return <div className="py-20 text-center text-[var(--muted)]">Loading…</div>;
@@ -48,6 +60,18 @@ export function SettingsPage({ onLogout }: { onLogout: () => void }) {
         maxSnipeTaxBps: Number.isFinite(tax) ? Math.max(0, Math.min(10000, tax)) : settings.maxSnipeTaxBps,
       },
       "Settings saved",
+    );
+  }
+
+  async function saveSpeed() {
+    await save(
+      {
+        priorityFeeGwei: priorityFee || "0",
+        gasLimit: gasLimit || "0",
+        rpcUrl: rpcUrl.trim(),
+        wsUrl: wsUrl.trim(),
+      },
+      "Speed settings saved — reconnecting",
     );
   }
 
@@ -263,6 +287,84 @@ export function SettingsPage({ onLogout }: { onLogout: () => void }) {
       </Card>
 
       <Card>
+        <div className="font-display text-[16px] font-bold">Speed &amp; network</div>
+        <div className="text-[12.5px] text-[var(--muted-dim)]">
+          The levers that make sniping fast. Leave a field blank to use the .env value.
+        </div>
+
+        <div className="mt-4 space-y-4">
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <Label>Priority fee (gwei)</Label>
+              <Field
+                value={priorityFee}
+                onChange={(e) => setPriorityFee(e.target.value)}
+                placeholder="0"
+              />
+            </div>
+            <div>
+              <Label>Gas limit</Label>
+              <Field
+                value={gasLimit}
+                onChange={(e) => setGasLimit(e.target.value)}
+                placeholder="0 = estimate"
+              />
+            </div>
+          </div>
+
+          <div>
+            <Label>RPC URL (HTTP)</Label>
+            <Field
+              mono
+              value={rpcUrl}
+              onChange={(e) => setRpcUrl(e.target.value)}
+              placeholder="blank = .env endpoint"
+            />
+          </div>
+
+          <div>
+            <Label>WebSocket URL</Label>
+            <Field
+              mono
+              value={wsUrl}
+              onChange={(e) => setWsUrl(e.target.value)}
+              placeholder="blank = polling"
+            />
+            <div className="mt-1.5 text-[12px] text-[var(--muted-dim)]">
+              Paste a WebSocket endpoint (paid providers give you one) to switch the watcher from
+              polling to instant push. Saved changes reconnect the watcher automatically.
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3 py-1">
+            <div className="min-w-0 flex-1">
+              <div className="text-[14px] font-semibold">Batch RPC reads</div>
+              <div className="text-[12.5px] text-[var(--muted-dim)]">
+                Combines the buy-path reads into one request (faster). Auto-disabled if your RPC
+                rejects it.
+              </div>
+            </div>
+            <Toggle on={settings.rpcBatch} onChange={(next) => save({ rpcBatch: next })} />
+          </div>
+
+          <Button variant="primary" className="w-full" onClick={saveSpeed}>
+            Save speed settings
+          </Button>
+
+          <div className="flex items-center justify-between text-[12.5px]">
+            <span className="text-[var(--muted-dim)]">Active feed</span>
+            <Pill tone={status?.watcher.logsPush ? "success" : status?.watcher.transport === "websocket" ? "brand" : "muted"}>
+              {status?.watcher.logsPush
+                ? "wallet push"
+                : status?.watcher.transport === "websocket"
+                  ? "block push"
+                  : (status?.watcher.transport ?? "—")}
+            </Pill>
+          </div>
+        </div>
+      </Card>
+
+      <Card>
         <div className="font-display text-[16px] font-bold">Connection</div>
         <div className="mt-3 space-y-2 text-[13px]">
           <ConnRow label="Chain" value="Robinhood Chain · 4663" />
@@ -276,7 +378,14 @@ export function SettingsPage({ onLogout }: { onLogout: () => void }) {
           <ConnRow label="Factory" value={status?.pons.factory ?? "—"} mono />
           <ConnRow
             label="Feed"
-            value={status?.websocket ? "WebSocket" : "Polling"}
+            value={
+              status?.watcher.logsPush
+                ? "WebSocket (wallet push)"
+                : status?.watcher.transport === "websocket"
+                  ? "WebSocket (block push)"
+                  : "Polling"
+            }
+            tone={status?.watcher.transport === "websocket" ? "success" : undefined}
           />
           {status?.watcher.lastError ? (
             <ConnRow label="Last error" value={status.watcher.lastError} tone="error" />

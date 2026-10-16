@@ -1,5 +1,12 @@
 import { formatEther, formatUnits, parseUnits, type Address } from "viem";
-import { curveAbi, erc20Abi, makeWalletClient, publicClient, tokenAbi } from "./chain.js";
+import {
+  curveAbi,
+  erc20Abi,
+  gasOverrides,
+  makeWalletClient,
+  publicClient,
+  tokenAbi,
+} from "./chain.js";
 import { decryptSecret } from "./crypto.js";
 import { getDB, pushActivity, saveDB } from "./store.js";
 import { quoteCurveBuy, readCurveState, withSlippage } from "./quote.js";
@@ -81,7 +88,7 @@ export async function handleLaunch(
 async function reaction(
   event: LaunchEvent,
   symbol: string | undefined,
-  watched: WatchedWallet,
+  _watched: WatchedWallet,
 ): Promise<void> {
   const db = getDB();
   const { settings } = db;
@@ -233,7 +240,7 @@ async function buyOne(
       kind: "buy",
       level: "info",
       title: `DRY RUN (${who}) — would spend ${fmtAmount(spend, decimals)} ${assetLabel} → ${symbol ?? "token"}`,
-      detail: `Min out ${fmtToken(quote.tokensOut === 0n ? 0n : minOut)} ${symbol ?? ""} · tax ${bpsToPct(quote.appliedSnipeTaxBps)}`.trim(),
+      detail: `Min out ${fmtToken(minOut)} ${symbol ?? ""} · tax ${bpsToPct(quote.appliedSnipeTaxBps)}`.trim(),
       token: event.token,
       tokenSymbol: symbol,
       curve: event.curve,
@@ -261,6 +268,7 @@ async function sendBuy(
   try {
     const privateKey = decryptSecret(buyer.encryptedKey) as `0x${string}`;
     const { wallet } = makeWalletClient(privateKey);
+    const overrides = await gasOverrides();
 
     if (state.isNativeQuote) {
       const balance = await publicClient.getBalance({ address: recipient });
@@ -275,53 +283,89 @@ async function sendBuy(
         });
         return;
       }
-    } else {
-      const balance = (await publicClient.readContract({
+
+      const hash = await wallet.writeContract({
+        address: event.curve,
+        abi: curveAbi,
+        functionName: "buy",
+        args: [spend, minOut, recipient],
+        value: spend,
+        ...overrides,
+        account: wallet.account!,
+        chain: wallet.chain,
+      });
+      reportBuy(event, symbol, who, spend, decimals, assetLabel, minOut, hash);
+      return;
+    }
+
+    // ── ERC-20 paired launch ──────────────────────────────────────────────
+    const balance = (await publicClient.readContract({
+      address: state.pairToken,
+      abi: erc20Abi,
+      functionName: "balanceOf",
+      args: [recipient],
+    })) as bigint;
+    if (balance < spend) {
+      pushActivity({
+        kind: "skip",
+        level: "warn",
+        title: `Buy skipped (${who}) — underfunded`,
+        detail: `Needs ${fmtAmount(spend, decimals)} ${assetLabel}, has ${fmtAmount(balance, decimals)}.`,
+        token: event.token,
+        tokenSymbol: symbol,
+      });
+      return;
+    }
+
+    const allowance = (await publicClient.readContract({
+      address: state.pairToken,
+      abi: erc20Abi,
+      functionName: "allowance",
+      args: [recipient, event.curve],
+    })) as bigint;
+
+    if (allowance < spend) {
+      // Approval is per-curve. Fire approve and buy back-to-back with
+      // sequential nonces so they land together instead of waiting a block.
+      const nonce = await publicClient.getTransactionCount({
+        address: recipient,
+        blockTag: "pending",
+      });
+
+      const approveHash = await wallet.writeContract({
         address: state.pairToken,
         abi: erc20Abi,
-        functionName: "balanceOf",
-        args: [recipient],
-      })) as bigint;
-      if (balance < spend) {
-        pushActivity({
-          kind: "skip",
-          level: "warn",
-          title: `Buy skipped (${who}) — underfunded`,
-          detail: `Needs ${fmtAmount(spend, decimals)} ${assetLabel}, has ${fmtAmount(balance, decimals)}.`,
-          token: event.token,
-          tokenSymbol: symbol,
-        });
-        return;
-      }
+        functionName: "approve",
+        args: [event.curve, spend],
+        nonce,
+        ...overrides,
+        account: wallet.account!,
+        chain: wallet.chain,
+      });
 
-      // ERC-20 pairs need a one-time approval to the launch's own curve.
-      const allowance = (await publicClient.readContract({
-        address: state.pairToken,
-        abi: erc20Abi,
-        functionName: "allowance",
-        args: [recipient, event.curve],
-      })) as bigint;
+      pushActivity({
+        kind: "info",
+        level: "info",
+        title: `Approving ${assetLabel} (${who})`,
+        detail: `Approve sent (${approveHash.slice(0, 10)}…) — buy follows immediately, no wait.`,
+        token: event.token,
+        tokenSymbol: symbol,
+        curve: event.curve,
+        txHash: approveHash,
+      });
 
-      if (allowance < spend) {
-        pushActivity({
-          kind: "info",
-          level: "info",
-          title: `Approving ${assetLabel} (${who})`,
-          detail: `ERC-20 paired launches need an approve step before the buy.`,
-          token: event.token,
-          tokenSymbol: symbol,
-          curve: event.curve,
-        });
-        const approveHash = await wallet.writeContract({
-          address: state.pairToken,
-          abi: erc20Abi,
-          functionName: "approve",
-          args: [event.curve, spend],
-          account: wallet.account!,
-          chain: wallet.chain,
-        });
-        await publicClient.waitForTransactionReceipt({ hash: approveHash, timeout: 60_000 });
-      }
+      const hash = await wallet.writeContract({
+        address: event.curve,
+        abi: curveAbi,
+        functionName: "buy",
+        args: [spend, minOut, recipient],
+        nonce: nonce + 1,
+        ...overrides,
+        account: wallet.account!,
+        chain: wallet.chain,
+      });
+      reportBuy(event, symbol, who, spend, decimals, assetLabel, minOut, hash);
+      return;
     }
 
     const hash = await wallet.writeContract({
@@ -329,26 +373,11 @@ async function sendBuy(
       abi: curveAbi,
       functionName: "buy",
       args: [spend, minOut, recipient],
-      value: state.isNativeQuote ? spend : 0n,
+      ...overrides,
       account: wallet.account!,
       chain: wallet.chain,
     });
-
-    const db = getDB();
-    db.stats.buys += 1;
-    saveDB();
-
-    pushActivity({
-      kind: "buy",
-      level: "success",
-      title: `BUY SENT (${who}) — ${fmtAmount(spend, decimals)} ${assetLabel} → ${symbol ?? "token"}`,
-      detail: `Min out ${fmtToken(minOut)} · tx ${hash.slice(0, 12)}…`,
-      token: event.token,
-      tokenSymbol: symbol,
-      curve: event.curve,
-      txHash: hash,
-      amountEth: state.isNativeQuote ? formatEther(spend) : undefined,
-    });
+    reportBuy(event, symbol, who, spend, decimals, assetLabel, minOut, hash);
   } catch (err) {
     pushActivity({
       kind: "error",
@@ -360,6 +389,33 @@ async function sendBuy(
       curve: event.curve,
     });
   }
+}
+
+function reportBuy(
+  event: LaunchEvent,
+  symbol: string | undefined,
+  who: string,
+  spend: bigint,
+  decimals: number,
+  assetLabel: string,
+  minOut: bigint,
+  hash: string,
+): void {
+  const db = getDB();
+  db.stats.buys += 1;
+  saveDB();
+
+  pushActivity({
+    kind: "buy",
+    level: "success",
+    title: `BUY SENT (${who}) — ${fmtAmount(spend, decimals)} ${assetLabel} → ${symbol ?? "token"}`,
+    detail: `Min out ${fmtToken(minOut)} · tx ${hash.slice(0, 12)}…`,
+    token: event.token,
+    tokenSymbol: symbol,
+    curve: event.curve,
+    txHash: hash,
+    amountEth: assetLabel === "ETH" ? formatEther(spend) : undefined,
+  });
 }
 
 async function readDecimals(token: Address): Promise<number> {
@@ -409,6 +465,6 @@ function bpsToPct(bps: bigint): string {
 }
 
 function msg(err: unknown): string {
-  if (err instanceof Error) return err.message.split("\n")[0];
-  return String(err);
+  const raw = err instanceof Error ? err.message.split("\n")[0] : String(err);
+  return raw.replace(/\/v2\/[A-Za-z0-9_\-]{8,}/g, "/v2/***").replace(/alch_[A-Za-z0-9_\-]{6,}/g, "alch_***");
 }

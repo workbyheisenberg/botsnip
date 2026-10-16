@@ -7,7 +7,7 @@ import { encryptSecret } from "./crypto.js";
 import { checkPassword, cookieName, cookieOptions, issueToken, verifyToken } from "./auth.js";
 import { getDB, newId, publicState, pushActivity, saveDB, updateSettings } from "./store.js";
 import { PONS, publicClient } from "./chain.js";
-import { scanOnce, watcherStatus } from "./watcher.js";
+import { scanOnce, restartWatcher, watcherStatus } from "./watcher.js";
 import { executeLaunch, getLaunchInfo } from "./launcher.js";
 import { sendTelegram } from "./notify.js";
 import { config } from "./config.js";
@@ -111,6 +111,8 @@ api.post("/watched", requireAuth, (req, res) => {
   db.watched.push(wallet);
   saveDB();
   pushActivity({ kind: "info", level: "info", title: `Watching launch wallet ${address}` });
+  // Re-subscribe the push feed so the node filters for this wallet.
+  restartWatcher().catch(() => {});
   res.json({ ok: true, wallet });
 });
 
@@ -124,6 +126,7 @@ api.patch("/watched/:id", requireAuth, (req, res) => {
   if (typeof req.body?.label === "string") wallet.label = req.body.label.slice(0, 60);
   if (typeof req.body?.enabled === "boolean") wallet.enabled = req.body.enabled;
   saveDB();
+  restartWatcher().catch(() => {});
   res.json({ ok: true, wallet });
 });
 
@@ -132,6 +135,7 @@ api.delete("/watched/:id", requireAuth, (req, res) => {
   const before = db.watched.length;
   db.watched = db.watched.filter((w) => w.id !== req.params.id);
   saveDB();
+  if (before !== db.watched.length) restartWatcher().catch(() => {});
   res.json({ ok: true, removed: before !== db.watched.length });
 });
 
@@ -224,6 +228,11 @@ const settingsSchema = z.object({
   nativePairOnly: z.boolean().optional(),
   maxSnipeTaxBps: z.number().int().min(0).max(10000).optional(),
   watchAllLaunches: z.boolean().optional(),
+  priorityFeeGwei: z.string().regex(/^\d*\.?\d+$/, "Priority fee must be a number").optional(),
+  gasLimit: z.string().regex(/^\d*$/, "Gas limit must be a whole number").optional(),
+  rpcUrl: z.string().max(300).optional(),
+  wsUrl: z.string().max(300).optional(),
+  rpcBatch: z.boolean().optional(),
   telegramEnabled: z.boolean().optional(),
   telegramChatId: z.string().max(64).optional(),
   notifyLaunches: z.boolean().optional(),
@@ -232,13 +241,36 @@ const settingsSchema = z.object({
   notifyErrors: z.boolean().optional(),
 });
 
-api.put("/settings", requireAuth, (req, res) => {
+api.put("/settings", requireAuth, async (req, res) => {
   const parsed = settingsSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid input" });
     return;
   }
+  const before = getDB().settings;
+  const networkChanged =
+    (parsed.data.rpcUrl !== undefined && parsed.data.rpcUrl !== before.rpcUrl) ||
+    (parsed.data.wsUrl !== undefined && parsed.data.wsUrl !== before.wsUrl) ||
+    (parsed.data.rpcBatch !== undefined && parsed.data.rpcBatch !== before.rpcBatch) ||
+    (parsed.data.watchAllLaunches !== undefined &&
+      parsed.data.watchAllLaunches !== before.watchAllLaunches);
+
   const settings = updateSettings(parsed.data);
+
+  if (networkChanged) {
+    pushActivity({
+      kind: "info",
+      level: "info",
+      title: "Reconnecting to chain",
+      detail: settings.wsUrl
+        ? `WebSocket: ${settings.wsUrl}`
+        : settings.rpcUrl
+          ? `RPC: ${settings.rpcUrl}`
+          : "Using the .env endpoint",
+    });
+    restartWatcher().catch(() => {});
+  }
+
   res.json({ ok: true, settings });
 });
 

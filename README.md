@@ -113,6 +113,73 @@ Two ways to watch:
 
 Both paths feed **Activity** and, if enabled, **Telegram**.
 
+### How detection works (and why it's built this way)
+
+A wallet's token launch is announced by the **pons factory**, not by the wallet itself. The event
+carries the deployer address, and you **cannot know in advance which block** a wallet will act in —
+a chain is a continuous stream, so something has to listen continuously. What you *can* do is make
+the node do the filtering, so you only ever wake up for **your own** wallets.
+
+Larper uses the best method the endpoint supports, in this order:
+
+1. **Wallet push (best).** A WebSocket `logs` subscription filtered to the factory's
+   `TokenLaunched` event **and your wallet addresses** (`topics[3]` = deployer). The node pushes a
+   message the instant one of *your* wallets launches — no scanning, no polling, no block ranges.
+   Shown in Settings as **"wallet push"**.
+2. **Block push.** If the endpoint accepts `newHeads` but not `logs`, Larper watches new blocks and
+   fetches each block's logs. Shown as **"block push"**.
+3. **Polling.** No WebSocket — it polls the head and fetches logs in chunks. Shown as **"polling"**.
+
+> **What's not possible:** reading the wallet's transaction *before* it's mined. Robinhood Chain
+> doesn't expose pending transactions (`alchemy_pendingTransactions` returns nothing), so the
+> earliest anyone can buy is the block **after** the launch lands. Only your *own* atomic launch
+> can put your buy in the same transaction.
+
+`eth_getLogs` range limits are handled automatically: if an RPC caps the range (Alchemy Free caps
+it at **10 blocks**), Larper detects the error, shrinks its chunk size, and keeps going.
+
+## Speed tuning
+
+Everything here is configurable from **Settings → Speed & network** — no rebuild, and changing the
+RPC/WebSocket reconnects the watcher automatically.
+
+| Setting | What it does |
+| --- | --- |
+| **WebSocket URL** | Switches the watcher to a **push feed**. We subscribe to `newHeads` (block heartbeats, ~10/s on this chain) and fetch each block's logs immediately — so detection happens within milliseconds of a launch being mined, instead of waiting on a poll interval. Works on endpoints that serve `newHeads` but not `logs`. |
+| **RPC URL (HTTP)** | Point at a paid fast node. Used for reads, log fetches, receipts and sends. |
+| **Batch RPC reads** | Collapses the buy path's ~9 concurrent contract reads into **one** HTTP request. Measured **~2.2×** faster (≈1.2s → ≈0.57s on the public RPC). Auto-disabled if the endpoint rejects batching. |
+| **Priority fee (gwei)** | Added to buy transactions. Measured on-chain: base fee ≈ 0.02 gwei, top observed priority ≈ 0.1 gwei — so `0.1` is already top-of-market and costs ~$0.15/tx. |
+| **Gas limit** | Skips gas estimation (one fewer round-trip). You only pay for gas *used*, so a generous limit is free insurance. |
+
+**Robustness:** a watchdog detects a silent socket (45s without a block) and reconnects; if that
+fails it drops back to polling. Detection is **contiguous from the cursor**, so a dropped
+`newHeads` message can never cause a skipped block (verified: live push count == replayed count).
+
+### RPC / WebSocket providers for Robinhood Chain
+
+- **Alchemy** — Robinhood's own docs call it the *recommended* provider. Free tier:
+  `https://robinhood-mainnet.g.alchemy.com/v2/{KEY}` and `wss://robinhood-mainnet.g.alchemy.com/v2/{KEY}`
+- Others: QuickNode, Chainstack, Dwellir, dRPC, Blockdaemon, Validation Cloud, BoltRPC
+- A **free** public WebSocket exists at `wss://rpc-robinhood.blockmachine.io` (no key; rate-limited)
+
+> 🔒 Lookalike/phishing RPC sites exist for this chain — only use URLs from official docs or your
+> provider's dashboard.
+
+Useful diagnostics:
+
+```bash
+npm --workspace server run probe-gas       # current fee market
+npm --workspace server run probe-latency -- <curve>   # batching speedup
+npm --workspace server run probe-ws -- <wss-url>      # what a WS endpoint actually serves
+```
+
+### The approve step (ERC-20 pairs)
+
+For a token-paired launch (e.g. USDG), ERC-20 requires an approval to that launch's **curve**, and
+the curve is new for every launch — so it can't be pre-approved or removed. Larper fires
+**approve and buy back-to-back with sequential nonces** so they land in the **same block** rather
+than one block apart. Native-ETH launches need no approval at all.
+
 ## Testing detection
 
 You don't have to wait for your own launch to prove it works.
@@ -275,6 +342,9 @@ Docs: `docs.ponsfamily.com/v2` · App: `ponsfamily.com` (be careful of lookalike
 - [x] **Atomic launch + buy** via the `launchAndBuy` router (Launch screen).
 - [x] **Multiple buying wallets per launch** (bundle across the 5% caps).
 - [x] **Telegram alerts** on detection, buys, skips and errors.
+- [x] **WebSocket push feed**, priority fee, gas limit, RPC/WS config from the console.
+- [x] **Batched approve + buy** (sequential nonces, no wait).
+- [x] **Batched RPC reads** (~2.2× faster buy decisions) with auto-detection.
 - [ ] Confirm fills (receipt parsing) and post-buy price tracking.
-- [ ] WebSocket subscription when `ROBINHOOD_WS_URL` is set.
+- [ ] Pre-approve the launch-and-buy router once (removes the approve on *your own* ERC-20 launches).
 - [ ] Auto-claim creator fees from the escrow.

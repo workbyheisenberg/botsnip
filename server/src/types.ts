@@ -40,6 +40,17 @@ export interface Settings {
   /** Notify on EVERY launch (monitor only — never buys). Useful for testing. */
   watchAllLaunches: boolean;
 
+  /** Priority fee in gwei added to buy transactions ("0" = node default). */
+  priorityFeeGwei: string;
+  /** Explicit gas limit for buy transactions ("0" = estimate). */
+  gasLimit: string;
+  /** RPC URL override from the console (empty = use .env). */
+  rpcUrl: string;
+  /** WebSocket URL override from the console (empty = use .env / polling). */
+  wsUrl: string;
+  /** Batch JSON-RPC reads into one request (turn off if your RPC rejects it). */
+  rpcBatch: boolean;
+
   /** Telegram alerting. */
   telegramEnabled: boolean;
   telegramChatId: string;

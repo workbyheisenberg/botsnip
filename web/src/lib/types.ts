@@ -27,6 +27,11 @@ export interface Settings {
   nativePairOnly: boolean;
   maxSnipeTaxBps: number;
   watchAllLaunches: boolean;
+  priorityFeeGwei: string;
+  gasLimit: string;
+  rpcUrl: string;
+  wsUrl: string;
+  rpcBatch: boolean;
   telegramEnabled: boolean;
   telegramChatId: string;
   notifyLaunches: boolean;
@@ -127,6 +132,8 @@ export interface StatusInfo {
   watcher: {
     running: boolean;
     connected: boolean;
+    transport: "websocket" | "polling" | "idle";
+    logsPush: boolean;
     head: string;
     scanned: string;
     lastError: string | null;

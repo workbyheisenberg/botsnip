@@ -5,11 +5,13 @@ import {
   http,
   parseAbi,
   parseAbiItem,
+  webSocket,
   type Address,
   type PublicClient,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { config } from "./config.js";
+import { getDB, pushActivity, saveDB } from "./store.js";
 
 export const robinhoodChain = defineChain({
   id: 4663,
@@ -21,10 +23,150 @@ export const robinhoodChain = defineChain({
   },
 });
 
-export const publicClient: PublicClient = createPublicClient({
-  chain: robinhoodChain,
-  transport: http(config.rpcUrl),
-});
+/** RPC URL in effect: the UI setting overrides the .env value when set. */
+export function effectiveRpcUrl(): string {
+  try {
+    const url = getDB()?.settings?.rpcUrl?.trim();
+    if (url) return url;
+  } catch {
+    /* store not ready */
+  }
+  return config.rpcUrl;
+}
+
+/** WebSocket URL in effect (empty = no push feed, polling instead). */
+export function effectiveWsUrl(): string {
+  try {
+    const url = getDB()?.settings?.wsUrl?.trim();
+    if (url) return url;
+  } catch {
+    /* store not ready */
+  }
+  return config.wsUrl;
+}
+
+function makeHttpClient(url: string): PublicClient {
+  // `batch: true` aggregates all JSON-RPC calls made in the same tick into a
+  // single HTTP request. The buy path reads ~9 curve fields at once, so this
+  // cuts several round-trips per buy. Auto-disabled if the endpoint rejects it.
+  let batch = true;
+  try {
+    batch = getDB()?.settings?.rpcBatch !== false;
+  } catch {
+    /* default to true */
+  }
+  return createPublicClient({ chain: robinhoodChain, transport: http(url, { batch }) });
+}
+
+/**
+ * Verify the RPC accepts batched JSON-RPC. Some endpoints (e.g. Blockmachine's
+ * HTTP node) return a single object instead of an array and blow up. If so,
+ * turn batching off automatically so reads/buys keep working.
+ */
+export async function ensureBatchSupport(): Promise<void> {
+  let enabled = true;
+  try {
+    enabled = getDB()?.settings?.rpcBatch !== false;
+  } catch {
+    /* ignore */
+  }
+  if (!enabled) return;
+
+  const url = effectiveRpcUrl();
+  try {
+    const probe = createPublicClient({ chain: robinhoodChain, transport: http(url, { batch: true }) });
+    // Must exercise eth_call specifically — the buy path is dominated by
+    // concurrent contract reads, and some endpoints only choke on batched calls.
+    await Promise.all([
+      probe.readContract({ address: PONS.factory, abi: factoryAbi, functionName: "launchFee" }),
+      probe.readContract({ address: PONS.factory, abi: factoryAbi, functionName: "launchConfigCount" }),
+      probe.readContract({ address: PONS.factory, abi: factoryAbi, functionName: "maxCreatorTaxBps" }),
+    ]);
+  } catch {
+    const db = getDB();
+    db.settings.rpcBatch = false;
+    saveDB();
+    pushActivity({
+      kind: "info",
+      level: "warn",
+      title: "RPC rejected request batching — disabled",
+      detail: `${url} does not support batched JSON-RPC. Speed reads are unbatched. Switch to a provider that supports batching (e.g. Alchemy) and re-enable it in Settings.`,
+    });
+  }
+}
+
+/** HTTP client for reads, getLogs, receipts, balances. */
+export let publicClient: PublicClient = makeHttpClient(config.rpcUrl);
+
+/** Optional WebSocket client used only for the live push feed. */
+export let wsClient: PublicClient | null = null;
+
+/** Rebuild both clients from the current effective URLs. */
+export function rebuildClients(): { rpc: string; ws: string } {
+  const rpc = effectiveRpcUrl();
+  const ws = effectiveWsUrl();
+  publicClient = makeHttpClient(rpc);
+  wsClient = ws
+    ? createPublicClient({
+        chain: robinhoodChain,
+        transport: webSocket(ws, { keepAlive: true, retryCount: 8 }),
+      })
+    : null;
+  return { rpc, ws };
+}
+
+export interface GasOverrides {
+  maxFeePerGas?: bigint;
+  maxPriorityFeePerGas?: bigint;
+  gas?: bigint;
+}
+
+/** Build fee/gas overrides from the site settings (priority fee, gas limit). */
+export async function gasOverrides(): Promise<GasOverrides> {
+  const overrides: GasOverrides = {};
+  let settings: { priorityFeeGwei?: string; gasLimit?: string } = {};
+  try {
+    settings = getDB()?.settings ?? {};
+  } catch {
+    return overrides;
+  }
+
+  const priority = toGwei(settings.priorityFeeGwei);
+  if (priority > 0n) {
+    try {
+      const block = await publicClient.getBlock({ blockTag: "latest" });
+      const base = block.baseFeePerGas ?? 0n;
+      overrides.maxPriorityFeePerGas = priority;
+      overrides.maxFeePerGas = base * 2n + priority;
+    } catch {
+      overrides.maxPriorityFeePerGas = priority;
+    }
+  }
+
+  const gas = toBigInt(settings.gasLimit);
+  if (gas > 0n) overrides.gas = gas;
+
+  return overrides;
+}
+
+function toGwei(value: string | undefined): bigint {
+  try {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) return 0n;
+    return BigInt(Math.round(n * 1e9));
+  } catch {
+    return 0n;
+  }
+}
+
+function toBigInt(value: string | undefined): bigint {
+  try {
+    if (!value || !/^\d+$/.test(value.trim())) return 0n;
+    return BigInt(value.trim());
+  } catch {
+    return 0n;
+  }
+}
 
 /** pons v2 deployment on Robinhood Chain (chain id 4663). */
 export const PONS = {
@@ -107,10 +249,16 @@ export const tokenAbi = parseAbi([
 
 export function makeWalletClient(privateKey: `0x${string}`) {
   const account = privateKeyToAccount(privateKey);
+  let batch = true;
+  try {
+    batch = getDB()?.settings?.rpcBatch !== false;
+  } catch {
+    /* default */
+  }
   const wallet = createWalletClient({
     account,
     chain: robinhoodChain,
-    transport: http(config.rpcUrl),
+    transport: http(effectiveRpcUrl(), { batch }),
   });
   return { account, wallet };
 }
