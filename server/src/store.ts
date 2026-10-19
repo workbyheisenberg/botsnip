@@ -10,7 +10,7 @@ const DEFAULT_SETTINGS: Settings = {
   buyAmountEth: "0.02",
   slippageBps: 1500,
   nativePairOnly: true,
-  maxSnipeTaxBps: 100,
+  maxSnipeTaxBps: 300,
   watchAllLaunches: false,
   priorityFeeGwei: "0",
   gasLimit: "0",

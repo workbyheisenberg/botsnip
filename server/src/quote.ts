@@ -28,15 +28,19 @@ export interface CurveState {
   readyToGraduate: boolean;
 }
 
-export async function readCurveState(
-  client: PublicClient,
-  curve: Address,
-  recipient: Address,
-): Promise<CurveState> {
-  const read = (functionName: string, args?: readonly unknown[]) =>
-    client.readContract({ address: curve, abi: curveAbi, functionName: functionName as never, args: args as never });
+/** Everything about a curve that does NOT depend on who is doing the buying. */
+export type CurveCore = Omit<CurveState, "snipeTaxBps">;
 
-  const [isNativeQuote, pairToken, reserves, sellable, feeBps, creatorTaxBps, rawSnipe, graduated, ready] =
+/**
+ * Reads the buyer-independent curve fields in a single batch (8 calls).
+ * When several wallets buy the same launch, this only needs to run ONCE —
+ * the per-wallet read is just `currentSnipeTaxBps(recipient)`.
+ */
+export async function readCurveCore(client: PublicClient, curve: Address): Promise<CurveCore> {
+  const read = (functionName: string) =>
+    client.readContract({ address: curve, abi: curveAbi, functionName: functionName as never });
+
+  const [isNativeQuote, pairToken, reserves, sellable, feeBps, creatorTaxBps, graduated, ready] =
     await Promise.all([
       read("isNativeQuote"),
       read("pairToken"),
@@ -44,7 +48,6 @@ export async function readCurveState(
       read("sellableTokens"),
       read("feeBps"),
       read("creatorTaxBps"),
-      read("currentSnipeTaxBps", [recipient]),
       read("graduated"),
       read("readyToGraduate"),
     ]);
@@ -59,10 +62,35 @@ export async function readCurveState(
     sellable: sellable as bigint,
     feeBps: feeBps as bigint,
     creatorTaxBps: creatorTaxBps as bigint,
-    snipeTaxBps: rawSnipe as bigint,
     graduated: graduated as boolean,
     readyToGraduate: ready as boolean,
   };
+}
+
+/** The opening snipe tax (bps) for one specific token recipient. */
+export async function readSnipeTax(
+  client: PublicClient,
+  curve: Address,
+  recipient: Address,
+): Promise<bigint> {
+  return (await client.readContract({
+    address: curve,
+    abi: curveAbi,
+    functionName: "currentSnipeTaxBps",
+    args: [recipient],
+  })) as bigint;
+}
+
+export async function readCurveState(
+  client: PublicClient,
+  curve: Address,
+  recipient: Address,
+): Promise<CurveState> {
+  const [core, snipeTaxBps] = await Promise.all([
+    readCurveCore(client, curve),
+    readSnipeTax(client, curve, recipient),
+  ]);
+  return { ...core, snipeTaxBps };
 }
 
 export interface BuyQuote {

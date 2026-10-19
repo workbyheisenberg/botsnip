@@ -139,9 +139,12 @@ export function SettingsPage({ onLogout }: { onLogout: () => void }) {
 
           <div>
             <Label>Max opening snipe tax tolerated (%)</Label>
-            <Field value={maxTax} onChange={(e) => setMaxTax(e.target.value)} placeholder="1" />
+            <Field value={maxTax} onChange={(e) => setMaxTax(e.target.value)} placeholder="7" />
             <div className="mt-1.5 text-[12px] text-[var(--muted-dim)]">
-              If a buy would be taxed more than this, Larper refuses instead of paying it.
+              The opening tax is <strong>99%</strong> for the first ~1.5s, then steps to{" "}
+              <strong>~6%</strong>, then <strong>~0.2%</strong> after ~3s, then 0. Larper never pays
+              more than this — it waits the tax down. Exempt wallets (your own launches) read 0 and
+              buy instantly. Set 7 to buy at ~2s; set 0.3 to wait ~3s for a near-zero tax.
             </div>
           </div>
 

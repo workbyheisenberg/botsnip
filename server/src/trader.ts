@@ -6,10 +6,18 @@ import {
   makeWalletClient,
   publicClient,
   tokenAbi,
+  type GasOverrides,
 } from "./chain.js";
 import { decryptSecret } from "./crypto.js";
 import { getDB, pushActivity, saveDB } from "./store.js";
-import { quoteCurveBuy, readCurveState, withSlippage } from "./quote.js";
+import {
+  quoteCurveBuy,
+  readCurveCore,
+  readSnipeTax,
+  withSlippage,
+  type CurveCore,
+  type CurveState,
+} from "./quote.js";
 import { shortAddr } from "./util.js";
 import type { BuyingWallet, Settings, WatchedWallet } from "./types.js";
 
@@ -129,7 +137,82 @@ async function reaction(
     curve: event.curve,
   });
 
-  await Promise.allSettled(buyers.map((buyer) => buyOne(event, symbol, buyer, settings)));
+  // ── Shared work, done ONCE regardless of wallet count ────────────────────
+  // Reading the curve and the fee/priority settings does not depend on which
+  // wallet is buying. Doing it per wallet is what made extra wallets slow:
+  // 3 wallets meant 3x the RPC calls and 3 block fetches on the same path.
+
+  // Fire the curve read, every wallet's snipe-tax read, AND the gas/fee read
+  // in the same tick. viem batches all of them into ONE HTTP request
+  // (8 + N calls), so wallet count no longer multiplies the critical path.
+  let core: CurveCore;
+  let taxes: bigint[];
+  let overrides: GasOverrides;
+  try {
+    const [c, t, ov] = await Promise.all([
+      readCurveCore(publicClient, event.curve),
+      Promise.all(buyers.map((b) => readSnipeTax(publicClient, event.curve, b.address as Address))),
+      settings.mode === "live"
+        ? gasOverrides().catch(() => ({}) as GasOverrides)
+        : Promise.resolve({} as GasOverrides),
+    ]);
+    core = c;
+    taxes = t;
+    overrides = ov;
+  } catch (err) {
+    pushActivity({
+      kind: "error",
+      level: "error",
+      title: "Failed to read curve",
+      detail: msg(err),
+      token: event.token,
+      tokenSymbol: symbol,
+      curve: event.curve,
+    });
+    return;
+  }
+
+  // If any wallet isn't exempt, wait out the opening tax ONCE for all wallets.
+  // Polling inside each wallet multiplied the reads and stretched the exit.
+  const limit = BigInt(settings.maxSnipeTaxBps);
+  if (settings.mode === "live" && taxes.some((t) => t > limit)) {
+    taxes = await waitForSnipeTax(
+      event.curve,
+      buyers.map((b) => b.address as Address),
+      limit,
+    );
+  }
+
+  await Promise.allSettled(
+    buyers.map((buyer, i) =>
+      buyOne(event, symbol, buyer, settings, core, overrides, taxes[i] ?? 0n),
+    ),
+  );
+}
+
+/**
+ * The opening snipe tax decays from 99% to 0 over ~5s. If any recipient is
+ * above our limit we poll the tax ONCE for the whole wallet set (a single
+ * batched read per round) until they are all acceptable or we time out.
+ */
+async function waitForSnipeTax(
+  curve: Address,
+  recipients: Address[],
+  limit: bigint,
+): Promise<bigint[]> {
+  let taxes = await Promise.all(recipients.map((r) => readSnipeTax(publicClient, curve, r)));
+  if (taxes.every((t) => t <= limit)) return taxes;
+
+  const waitUntil = Date.now() + 5_000;
+  while (taxes.some((t) => t > limit) && Date.now() < waitUntil) {
+    await sleep(150);
+    try {
+      taxes = await Promise.all(recipients.map((r) => readSnipeTax(publicClient, curve, r)));
+    } catch {
+      break;
+    }
+  }
+  return taxes;
 }
 
 async function buyOne(
@@ -137,27 +220,15 @@ async function buyOne(
   symbol: string | undefined,
   buyer: BuyingWallet,
   settings: Settings,
+  core: CurveCore,
+  overrides: GasOverrides,
+  snipeTaxBps: bigint,
 ): Promise<void> {
   const db = getDB();
   const recipient = buyer.address as Address;
   const who = buyer.label || shortAddr(buyer.address);
 
-  let state;
-  try {
-    state = await readCurveState(publicClient, event.curve, recipient);
-  } catch (err) {
-    pushActivity({
-      kind: "error",
-      level: "error",
-      title: `Failed to read curve (${who})`,
-      detail: msg(err),
-      token: event.token,
-      tokenSymbol: symbol,
-    });
-    return;
-  }
-
-  if (state.readyToGraduate || state.graduated) {
+  if (core.readyToGraduate || core.graduated) {
     db.stats.skipped += 1;
     saveDB();
     pushActivity({
@@ -171,7 +242,7 @@ async function buyOne(
     return;
   }
 
-  const native = state.isNativeQuote;
+  const native = core.isNativeQuote;
 
   if (!native && settings.nativePairOnly) {
     db.stats.skipped += 1;
@@ -180,7 +251,7 @@ async function buyOne(
       kind: "skip",
       level: "warn",
       title: `Skipped (${who}) — non-ETH pairing`,
-      detail: `Paired against ${state.pairToken}. Turn OFF "Native ETH pairs only" in Settings to buy token-paired launches.`,
+      detail: `Paired against ${core.pairToken}. Turn OFF "Native ETH pairs only" in Settings to buy token-paired launches.`,
       token: event.token,
       tokenSymbol: symbol,
     });
@@ -194,8 +265,10 @@ async function buyOne(
   if (native) {
     spend = safeParseUnits(buyer.amountEth, 18);
   } else {
-    decimals = await readDecimals(state.pairToken);
-    assetLabel = (await readSymbol(state.pairToken)) ?? "pair token";
+    // Pair-token metadata never changes, so it is cached across launches.
+    const meta = await readPairMeta(core.pairToken);
+    decimals = meta.decimals;
+    assetLabel = meta.symbol ?? "pair token";
     spend = safeParseUnits(buyer.amountQuote, decimals);
   }
 
@@ -215,6 +288,9 @@ async function buyOne(
     return;
   }
 
+  // The snipe tax was read (and, if needed, waited out) for all wallets in the
+  // shared step. Exempt wallets read 0, so the fast path gets zero extra calls.
+  const state: CurveState = { ...core, snipeTaxBps };
   const quote = quoteCurveBuy(spend, state);
   const minOut = withSlippage(quote.tokensOut, settings.slippageBps);
 
@@ -224,10 +300,10 @@ async function buyOne(
     pushActivity({
       kind: "skip",
       level: "warn",
-      title: `Buy REFUSED (${who}) — snipe tax would apply`,
+      title: `Buy REFUSED (${who}) — snipe tax too high`,
       detail:
-        `${who} is not exempt on this launch (tax ≈ ${bpsToPct(quote.appliedSnipeTaxBps)}). ` +
-        `Raise "Max snipe tax tolerated" or add this wallet to the launch's exemption list.`,
+        `${who} is not exempt on this launch (tax ≈ ${bpsToPct(quote.appliedSnipeTaxBps)}, limit ${bpsToPct(BigInt(settings.maxSnipeTaxBps))}). ` +
+        `The opening tax decays to ~3% after 2s and 0 after 5s.`,
       token: event.token,
       tokenSymbol: symbol,
       curve: event.curve,
@@ -249,18 +325,19 @@ async function buyOne(
     return;
   }
 
-  await sendBuy(event, symbol, buyer, state, spend, decimals, assetLabel, minOut);
+  await sendBuy(event, symbol, buyer, state, spend, decimals, assetLabel, minOut, overrides);
 }
 
 async function sendBuy(
   event: LaunchEvent,
   symbol: string | undefined,
   buyer: BuyingWallet,
-  state: Awaited<ReturnType<typeof readCurveState>>,
+  state: CurveState,
   spend: bigint,
   decimals: number,
   assetLabel: string,
   minOut: bigint,
+  overrides: GasOverrides,
 ): Promise<void> {
   const who = buyer.label || shortAddr(buyer.address);
   const recipient = buyer.address as Address;
@@ -268,7 +345,6 @@ async function sendBuy(
   try {
     const privateKey = decryptSecret(buyer.encryptedKey) as `0x${string}`;
     const { wallet } = makeWalletClient(privateKey);
-    const overrides = await gasOverrides();
 
     if (state.isNativeQuote) {
       const balance = await publicClient.getBalance({ address: recipient });
@@ -317,62 +393,43 @@ async function sendBuy(
       return;
     }
 
-    const allowance = (await publicClient.readContract({
+    // Approval is per-curve, and this curve was created seconds ago by the
+    // launch we just detected — so its allowance for this wallet is provably
+    // zero. Reading `allowance` costs a full RPC round-trip on the critical
+    // path for a value we already know, so we skip it and always approve.
+    const nonce = await publicClient.getTransactionCount({
+      address: recipient,
+      blockTag: "pending",
+    });
+
+    const approveHash = await wallet.writeContract({
       address: state.pairToken,
       abi: erc20Abi,
-      functionName: "allowance",
-      args: [recipient, event.curve],
-    })) as bigint;
+      functionName: "approve",
+      args: [event.curve, spend],
+      nonce,
+      ...overrides,
+      account: wallet.account!,
+      chain: wallet.chain,
+    });
 
-    if (allowance < spend) {
-      // Approval is per-curve. Fire approve and buy back-to-back with
-      // sequential nonces so they land together instead of waiting a block.
-      const nonce = await publicClient.getTransactionCount({
-        address: recipient,
-        blockTag: "pending",
-      });
-
-      const approveHash = await wallet.writeContract({
-        address: state.pairToken,
-        abi: erc20Abi,
-        functionName: "approve",
-        args: [event.curve, spend],
-        nonce,
-        ...overrides,
-        account: wallet.account!,
-        chain: wallet.chain,
-      });
-
-      pushActivity({
-        kind: "info",
-        level: "info",
-        title: `Approving ${assetLabel} (${who})`,
-        detail: `Approve sent (${approveHash.slice(0, 10)}…) — buy follows immediately, no wait.`,
-        token: event.token,
-        tokenSymbol: symbol,
-        curve: event.curve,
-        txHash: approveHash,
-      });
-
-      const hash = await wallet.writeContract({
-        address: event.curve,
-        abi: curveAbi,
-        functionName: "buy",
-        args: [spend, minOut, recipient],
-        nonce: nonce + 1,
-        ...overrides,
-        account: wallet.account!,
-        chain: wallet.chain,
-      });
-      reportBuy(event, symbol, who, spend, decimals, assetLabel, minOut, hash);
-      return;
-    }
+    pushActivity({
+      kind: "info",
+      level: "info",
+      title: `Approving ${assetLabel} (${who})`,
+      detail: `Approve sent (${approveHash.slice(0, 10)}…) — buy follows immediately, no wait.`,
+      token: event.token,
+      tokenSymbol: symbol,
+      curve: event.curve,
+      txHash: approveHash,
+    });
 
     const hash = await wallet.writeContract({
       address: event.curve,
       abi: curveAbi,
       functionName: "buy",
       args: [spend, minOut, recipient],
+      nonce: nonce + 1,
       ...overrides,
       account: wallet.account!,
       chain: wallet.chain,
@@ -439,6 +496,20 @@ async function readSymbol(token: Address): Promise<string | undefined> {
   }
 }
 
+/** Pair-token metadata (decimals/symbol) never changes — cache it per address. */
+const pairMetaCache = new Map<string, { decimals: number; symbol?: string }>();
+
+async function readPairMeta(token: Address): Promise<{ decimals: number; symbol?: string }> {
+  const key = token.toLowerCase();
+  const cached = pairMetaCache.get(key);
+  if (cached) return cached;
+
+  const [decimals, symbol] = await Promise.all([readDecimals(token), readSymbol(token)]);
+  const meta = { decimals, symbol };
+  pairMetaCache.set(key, meta);
+  return meta;
+}
+
 function safeParseUnits(value: string, decimals: number): bigint {
   try {
     const parsed = parseUnits((value || "0").trim(), decimals);
@@ -462,6 +533,10 @@ function fmtAmount(value: bigint, decimals: number): string {
 
 function bpsToPct(bps: bigint): string {
   return `${(Number(bps) / 100).toFixed(2)}%`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function msg(err: unknown): string {

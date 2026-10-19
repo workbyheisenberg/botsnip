@@ -11,7 +11,9 @@
     "scan-history": "tsx src/scripts/scan-history.ts",
     "probe-gas": "tsx src/scripts/probe-gas.ts",
     "probe-latency": "tsx src/scripts/probe-latency.ts",
-    "probe-ws": "tsx src/scripts/probe-ws.ts"
+    "probe-ws": "tsx src/scripts/probe-ws.ts",
+    "probe-pairs": "tsx src/scripts/probe-pairs.ts",
+    "probe-multiwallet": "tsx src/scripts/probe-multiwallet.ts"
   },
   "dependencies": {
     "cookie-parser": "^1.4.7",

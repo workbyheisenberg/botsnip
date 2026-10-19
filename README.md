@@ -147,7 +147,7 @@ RPC/WebSocket reconnects the watcher automatically.
 | --- | --- |
 | **WebSocket URL** | Switches the watcher to a **push feed**. We subscribe to `newHeads` (block heartbeats, ~10/s on this chain) and fetch each block's logs immediately — so detection happens within milliseconds of a launch being mined, instead of waiting on a poll interval. Works on endpoints that serve `newHeads` but not `logs`. |
 | **RPC URL (HTTP)** | Point at a paid fast node. Used for reads, log fetches, receipts and sends. |
-| **Batch RPC reads** | Collapses the buy path's ~9 concurrent contract reads into **one** HTTP request. Measured **~2.2×** faster (≈1.2s → ≈0.57s on the public RPC). Auto-disabled if the endpoint rejects batching. |
+| **Batch RPC reads** | Collapses the buy path's concurrent contract reads into **one** HTTP request — including across *all* buying wallets (8 + N calls instead of 9 × N). Auto-disabled if the endpoint rejects batching. |
 | **Priority fee (gwei)** | Added to buy transactions. Measured on-chain: base fee ≈ 0.02 gwei, top observed priority ≈ 0.1 gwei — so `0.1` is already top-of-market and costs ~$0.15/tx. |
 | **Gas limit** | Skips gas estimation (one fewer round-trip). You only pay for gas *used*, so a generous limit is free insurance. |
 
@@ -168,17 +168,53 @@ fails it drops back to polling. Detection is **contiguous from the cursor**, so 
 Useful diagnostics:
 
 ```bash
-npm --workspace server run probe-gas       # current fee market
-npm --workspace server run probe-latency -- <curve>   # batching speedup
-npm --workspace server run probe-ws -- <wss-url>      # what a WS endpoint actually serves
+npm --workspace server run probe-gas                    # current fee market
+npm --workspace server run probe-latency -- <curve>     # batching speedup
+npm --workspace server run probe-ws -- <wss-url>        # what a WS endpoint actually serves
+npm --workspace server run probe-pairs                  # pair tokens used by recent launches
+npm --workspace server run probe-multiwallet -- <curve> # RPC calls per wallet count
 ```
 
-### The approve step (ERC-20 pairs)
+### Buying with several wallets
 
-For a token-paired launch (e.g. USDG), ERC-20 requires an approval to that launch's **curve**, and
-the curve is new for every launch — so it can't be pre-approved or removed. Larper fires
-**approve and buy back-to-back with sequential nonces** so they land in the **same block** rather
-than one block apart. Native-ETH launches need no approval at all.
+Wallets fire **in parallel**, so buying with 3 wallets is not 3× slower by design. But the old path
+repeated the same work per wallet, which multiplied the RPC call volume and pushed the provider's
+rate limiter — that is what showed up as a ~1s stall.
+
+Shared work is now done **once per launch**, and only the genuinely per-wallet read
+(`currentSnipeTaxBps(recipient)`) repeats:
+
+| Buying wallets | RPC calls (before) | RPC calls (now) |
+| --- | --- | --- |
+| 1 | 9 reads + 1 block fetch | 9 reads + 1 block fetch |
+| 2 | 18 reads + 2 block fetches | 10 reads + 1 block fetch |
+| 3 | 27 reads + 3 block fetches | 11 reads + 1 block fetch |
+
+The block fetch is the heavy one (`eth_getBlockByNumber` returns every tx hash in the block), and
+it used to run once per wallet.
+
+### The approve step (ERC-20 pairs, e.g. USDG)
+
+A token-paired launch takes only its pairing asset — a USDG curve **rejects ETH**
+(`UnexpectedNativeValue`). ERC-20 approval is to that launch's **curve**, and the curve is new for
+every launch, so it can't be pre-approved or removed. Larper fires **approve and buy back-to-back
+with sequential nonces** so they land in the **same block** rather than one block apart.
+
+Because the curve was created seconds ago, its allowance for the buying wallet is **provably zero**,
+so Larper no longer reads `allowance` at all (a wasted round-trip on the critical path). Pair-token
+metadata (`decimals`/`symbol`) is cached. Native-ETH launches need no approval at all.
+
+### The opening snipe tax
+
+Every launch opens with a buy tax that starts at **99% and decays to 0 over ~5s** (~25% at 1s, ~3%
+at 2s). It applies to buys only, and the launcher, the creator-fee recipient, and any wallets named
+at launch are **exempt**.
+
+- **Exempt wallets read 0** → instant buy, no wait. Larper auto-adds all enabled buying wallets to
+  the exemption list on its own launches, so this is the normal case.
+- **Non-exempt buys wait it out** rather than paying it: Larper polls the tax until it falls to the
+  **Max opening snipe tax tolerated** setting (default 3%), up to ~5s. Faster than that is not
+  free — being first just pays more tax.
 
 ## Testing detection
 
