@@ -93,11 +93,13 @@ export interface LaunchPlan {
   totalCostEth: string;
   launchFeeEth: string;
   buyEth: string;
+  buySymbol: string;
   expectedTokens: string;
   minTokensOut: string;
   recipient: string;
   exemptions: string[];
   pairToken: string;
+  needsApproval: boolean;
 }
 
 export interface LaunchResult {
@@ -117,7 +119,8 @@ export interface LaunchRequest {
   socials?: Record<string, string>;
   launchConfigId: string;
   pairToken?: string;
-  buyAmountEth: string;
+  buyAmountEth?: string;
+  buyAmountQuote?: string;
   creatorTaxBps?: number;
   buybackEnabled?: boolean;
   creatorFeeRecipient?: string;

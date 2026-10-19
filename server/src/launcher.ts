@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
-import { formatEther, parseEther, parseEventLogs, toHex, zeroAddress, type Address } from "viem";
+import { formatEther, formatUnits, maxUint256, parseEventLogs, parseUnits, toHex, zeroAddress, type Address } from "viem";
 import {
+  erc20Abi,
   factoryAbi,
   launchAndBuyAbi,
   makeWalletClient,
@@ -114,7 +115,10 @@ export interface LaunchInput {
   };
   launchConfigId: string;
   pairToken?: string; // "native" or an ERC-20 address
-  buyAmountEth: string;
+  /** Buy amount in ETH (native launches). */
+  buyAmountEth?: string;
+  /** Buy amount in the pair token's own units (ERC-20 launches, e.g. USDG). */
+  buyAmountQuote?: string;
   creatorTaxBps?: number;
   buybackEnabled?: boolean;
   creatorFeeRecipient?: string;
@@ -130,11 +134,15 @@ export interface LaunchResult {
     totalCostEth: string;
     launchFeeEth: string;
     buyEth: string;
+    /** "ETH", "USDG", … — the asset the first buy is denominated in. */
+    buySymbol: string;
     expectedTokens: string;
     minTokensOut: string;
     recipient: string;
     exemptions: string[];
     pairToken: string;
+    /** True when a pair launch still needs an ERC-20 approval before it can run. */
+    needsApproval: boolean;
   };
   txHash?: string;
   token?: string;
@@ -178,8 +186,9 @@ export async function executeLaunch(input: LaunchInput): Promise<LaunchResult> {
   const pairToken = (!input.pairToken || input.pairToken === "native"
     ? zeroAddress
     : (input.pairToken as Address)) as Address;
+  const native = pairToken === zeroAddress;
 
-  if (pairToken !== zeroAddress) {
+  if (!native) {
     if (!isAddressLike(pairToken)) return { ok: false, error: "Invalid pair token address." };
     const approved = (await publicClient.readContract({
       address: PONS.factory,
@@ -190,11 +199,36 @@ export async function executeLaunch(input: LaunchInput): Promise<LaunchResult> {
     if (!approved) return { ok: false, error: "That pair token is not approved for launches." };
   }
 
-  let amountEth: bigint;
+  // Launch economics are recorded PER ASSET. A USDG launch is sized in USDG
+  // (6 decimals), so using the ETH config here would be wrong by 1e12.
+  let quoteDecimals = 18;
+  let buySymbol = "ETH";
+  let phantomQuote = config.phantomQuote;
+  let graduationThreshold = config.graduationThreshold;
+
+  if (!native) {
+    try {
+      const [phantom, threshold, decimals] = (await publicClient.readContract({
+        address: PONS.factory,
+        abi: factoryAbi,
+        functionName: "pairTokenEconomics",
+        args: [pairToken],
+      })) as readonly [bigint, bigint, number];
+      phantomQuote = phantom;
+      graduationThreshold = threshold;
+      quoteDecimals = Number(decimals);
+    } catch {
+      return { ok: false, error: "Could not read that pair token's launch economics." };
+    }
+    buySymbol = (await readErc20Symbol(pairToken)) ?? "pair";
+  }
+
+  const rawAmount = ((native ? input.buyAmountEth : input.buyAmountQuote) ?? "").trim();
+  let quoteIn: bigint;
   try {
-    amountEth = parseEther(input.buyAmountEth || "0");
+    quoteIn = parseUnits(rawAmount || "0", quoteDecimals);
   } catch {
-    return { ok: false, error: "Invalid buy amount." };
+    return { ok: false, error: `Invalid ${buySymbol} buy amount.` };
   }
 
   const creatorTaxBps = Math.max(0, Math.min(65535, Math.round(input.creatorTaxBps ?? 0)));
@@ -227,13 +261,49 @@ export async function executeLaunch(input: LaunchInput): Promise<LaunchResult> {
 
   const quote = quoteFreshLaunch({
     supply: config.supply,
-    phantomQuote: config.phantomQuote,
-    graduationThreshold: config.graduationThreshold,
+    phantomQuote,
+    graduationThreshold,
     curveFeeBps: config.curveFeeBps,
     creatorTaxBps: BigInt(creatorTaxBps),
-    quoteIn: amountEth,
+    quoteIn,
   });
   const minOut = withSlippage(quote.tokensOut, db.settings.slippageBps);
+
+  // Funding check up front, so a mistake is a clear message instead of a revert.
+  if (native) {
+    const balance = await publicClient.getBalance({ address: signer.address as Address });
+    if (balance < launchFee + quoteIn) {
+      return {
+        ok: false,
+        error: `Signing wallet needs ${formatEther(launchFee + quoteIn)} ETH (fee + buy), has ${formatEther(balance)}.`,
+      };
+    }
+  } else {
+    const balance = (await publicClient.readContract({
+      address: pairToken,
+      abi: erc20Abi,
+      functionName: "balanceOf",
+      args: [signer.address as Address],
+    })) as bigint;
+    if (balance < quoteIn) {
+      return {
+        ok: false,
+        error: `Signing wallet needs ${formatUnits(quoteIn, quoteDecimals)} ${buySymbol}, has ${formatUnits(balance, quoteDecimals)}.`,
+      };
+    }
+  }
+
+  // A custom-pair launch needs the router approved to pull the pair asset.
+  let needsApproval = false;
+  if (!native && quoteIn > 0n) {
+    const allowance = (await publicClient.readContract({
+      address: pairToken,
+      abi: erc20Abi,
+      functionName: "allowance",
+      args: [signer.address as Address, PONS.launchAndBuy],
+    })) as bigint;
+    needsApproval = allowance < quoteIn;
+  }
 
   // Every enabled buying wallet should be exempt so the team can bundle buys.
   const exemptions = Array.from(
@@ -248,18 +318,19 @@ export async function executeLaunch(input: LaunchInput): Promise<LaunchResult> {
     ),
   ) as Address[];
 
-  const native = pairToken === zeroAddress;
-  const value = native ? launchFee + amountEth : launchFee;
+  const value = native ? launchFee + quoteIn : launchFee;
 
   const plan = {
     totalCostEth: formatEther(value),
     launchFeeEth: formatEther(launchFee),
-    buyEth: formatEther(amountEth),
+    buyEth: formatUnits(quoteIn, quoteDecimals),
+    buySymbol,
     expectedTokens: quote.tokensOut.toString(),
     minTokensOut: minOut.toString(),
     recipient,
     exemptions,
     pairToken,
+    needsApproval,
   };
 
   if (input.dryRun) {
@@ -289,11 +360,33 @@ export async function executeLaunch(input: LaunchInput): Promise<LaunchResult> {
     const privateKey = decryptSecret(signer.encryptedKey) as `0x${string}`;
     const { wallet } = makeWalletClient(privateKey);
 
+    // ERC-20 pair: the router must be allowed to pull `quoteIn` before the
+    // launch runs. This is the one non-atomic step pons requires for pairs
+    // (approve, wait, then launchAndBuy). Native ETH needs none of this.
+    if (needsApproval) {
+      const approveHash = await wallet.writeContract({
+        address: pairToken,
+        abi: erc20Abi,
+        functionName: "approve",
+        args: [PONS.launchAndBuy, maxUint256],
+        account: wallet.account!,
+        chain: wallet.chain,
+      });
+      pushActivity({
+        kind: "info",
+        level: "info",
+        title: `Approving ${buySymbol} for launches`,
+        detail: `One-time approval sent (${approveHash.slice(0, 10)}…) — the launch follows once it lands.`,
+        txHash: approveHash,
+      });
+      await publicClient.waitForTransactionReceipt({ hash: approveHash, timeout: 90_000 });
+    }
+
     const hash = await wallet.writeContract({
       address: PONS.launchAndBuy,
       abi: launchAndBuyAbi,
       functionName: "launchAndBuy",
-      args: [params, BigInt(configId), pairToken, amountEth, minOut, recipient, exemptions],
+      args: [params, BigInt(configId), pairToken, quoteIn, minOut, recipient, exemptions],
       value,
       account: wallet.account!,
       chain: wallet.chain,
@@ -303,7 +396,7 @@ export async function executeLaunch(input: LaunchInput): Promise<LaunchResult> {
       kind: "info",
       level: "success",
       title: `Atomic launch sent — ${params.symbol}`,
-      detail: `Launch + first buy in one tx · ${plan.buyEth} ETH buy · wallet ${shortAddr(signer.address)}`,
+      detail: `Launch + first buy in one tx · ${plan.buyEth} ${plan.buySymbol} buy · wallet ${shortAddr(signer.address)}`,
       txHash: hash,
     });
 
@@ -322,13 +415,13 @@ export async function executeLaunch(input: LaunchInput): Promise<LaunchResult> {
       pushActivity({
         kind: "buy",
         level: "success",
-        title: `Launched ${params.name} (${params.symbol}) at ${plan.buyEth} ETH`,
+        title: `Launched ${params.name} (${params.symbol}) at ${plan.buyEth} ${plan.buySymbol}`,
         detail: token ? `token ${token} · curve ${curve}` : "confirmed on chain",
         token,
         tokenSymbol: params.symbol,
         curve,
         txHash: hash,
-        amountEth: plan.buyEth,
+        amountEth: native ? plan.buyEth : undefined,
       });
     } catch {
       /* receipt not needed for success */
@@ -339,5 +432,13 @@ export async function executeLaunch(input: LaunchInput): Promise<LaunchResult> {
     const message = err instanceof Error ? err.message.split("\n")[0] : String(err);
     pushActivity({ kind: "error", level: "error", title: "Atomic launch failed", detail: message });
     return { ok: false, error: message };
+  }
+}
+
+async function readErc20Symbol(token: Address): Promise<string | undefined> {
+  try {
+    return await publicClient.readContract({ address: token, abi: erc20Abi, functionName: "symbol" });
+  } catch {
+    return undefined;
   }
 }

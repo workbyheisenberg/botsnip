@@ -6,6 +6,9 @@ import { Button, Card, Field, Label, Pill, Row, Toggle } from "../components/ui"
 import type { LaunchInfo, LaunchRequest, LaunchResult } from "../lib/types";
 import { explorerTx, shortAddr } from "../lib/format";
 
+/** pons-approved pair asset on Robinhood Chain (6 decimals). */
+const USDG = "0x5fc5360d0400a0fd4f2af552add042d716f1d168";
+
 function tokens(value: string): string {
   const n = Number(value) / 1e18;
   if (!Number.isFinite(n)) return value;
@@ -29,6 +32,7 @@ export function LaunchPage() {
   const [configId, setConfigId] = useState("0");
   const [pairToken, setPairToken] = useState("");
   const [buyAmountEth, setBuyAmountEth] = useState(state?.settings.buyAmountEth ?? "0.02");
+  const [buyAmountQuote, setBuyAmountQuote] = useState("1");
   const [creatorTaxBps, setCreatorTaxBps] = useState(0);
   const [buybackEnabled, setBuybackEnabled] = useState(true);
   const [signerWalletId, setSignerWalletId] = useState("");
@@ -55,6 +59,7 @@ export function LaunchPage() {
   const enabledConfigs = useMemo(() => (info?.configs ?? []).filter((c) => c.enabled), [info]);
   const canLaunch = signerWalletId ? info?.canLaunch?.[signers.find((s) => s.id === signerWalletId)?.address ?? ""] : false;
   const exemptions = (state?.buying ?? []).filter((b) => b.enabled).map((b) => b.address);
+  const isPair = pairToken.trim().length > 0;
 
   function buildRequest(dryRun: boolean): LaunchRequest {
     return {
@@ -66,6 +71,7 @@ export function LaunchPage() {
       launchConfigId: configId,
       pairToken: pairToken.trim() || "native",
       buyAmountEth,
+      buyAmountQuote,
       creatorTaxBps,
       buybackEnabled,
       signerWalletId,
@@ -92,7 +98,9 @@ export function LaunchPage() {
     if (!live) return;
     if (
       !window.confirm(
-        `Launch ${symbol || name} and buy ${buyAmountEth} ETH atomically? This sends a REAL transaction and spends ETH.`,
+        isPair
+          ? `Launch ${symbol || name} paired against ${pairToken} and buy ${buyAmountQuote} of it atomically? This sends REAL transactions: a one-time approval (if needed) plus the launch fee in ETH.`
+          : `Launch ${symbol || name} and buy ${buyAmountEth} ETH atomically? This sends a REAL transaction and spends ETH.`,
       )
     ) {
       return;
@@ -191,8 +199,14 @@ export function LaunchPage() {
               </select>
             </div>
             <div>
-              <Label>First buy (ETH)</Label>
-              <Field value={buyAmountEth} onChange={(e) => setBuyAmountEth(e.target.value)} placeholder="0.02" />
+              <Label>First buy ({isPair ? "pair token" : "ETH"})</Label>
+              <Field
+                value={isPair ? buyAmountQuote : buyAmountEth}
+                onChange={(e) =>
+                  isPair ? setBuyAmountQuote(e.target.value) : setBuyAmountEth(e.target.value)
+                }
+                placeholder={isPair ? "1.0" : "0.02"}
+              />
             </div>
           </div>
 
@@ -213,6 +227,26 @@ export function LaunchPage() {
                 onChange={(e) => setPairToken(e.target.value)}
                 placeholder="blank = native ETH"
               />
+              <div className="mt-2 flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setPairToken("")}
+                  className={`rounded-xl px-3 py-1.5 text-[12px] font-semibold transition ${
+                    isPair ? "text-[var(--muted-dim)]" : "inset text-[var(--brand-400)]"
+                  }`}
+                >
+                  Native ETH
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPairToken(USDG)}
+                  className={`rounded-xl px-3 py-1.5 text-[12px] font-semibold transition ${
+                    isPair ? "inset text-[var(--brand-400)]" : "text-[var(--muted-dim)]"
+                  }`}
+                >
+                  USDG
+                </button>
+              </div>
             </div>
           </div>
 
@@ -298,11 +332,11 @@ export function LaunchPage() {
         <Card className="fade-up">
           <div className="font-display text-[15px] font-bold">Plan preview</div>
           <div className="mt-3 space-y-2 text-[13px]">
-            <PlanRow label="Total cost" value={`${Number(plan.plan.totalCostEth).toFixed(4)} ETH`} />
+            <PlanRow label="Launch fee (ETH)" value={`${Number(plan.plan.launchFeeEth).toFixed(6)} ETH`} />
             <Row />
-            <PlanRow label="Launch fee" value={`${Number(plan.plan.launchFeeEth).toFixed(4)} ETH`} />
+            <PlanRow label="First buy" value={`${plan.plan.buyEth} ${plan.plan.buySymbol}`} />
             <Row />
-            <PlanRow label="First buy" value={`${Number(plan.plan.buyEth).toFixed(4)} ETH`} />
+            <PlanRow label="ETH out of wallet" value={`${Number(plan.plan.totalCostEth).toFixed(6)} ETH`} />
             <Row />
             <PlanRow label="Expected tokens" value={tokens(plan.plan.expectedTokens)} />
             <Row />
@@ -312,6 +346,15 @@ export function LaunchPage() {
             <Row />
             <PlanRow label="Exempt wallets" value={String(plan.plan.exemptions.length)} />
           </div>
+          {plan.plan.needsApproval ? (
+            <div className="mt-3 flex items-start gap-2 text-[12px] text-[var(--warn)]">
+              <TriangleAlert size={14} className="mt-0.5 flex-none" />
+              <span>
+                First {plan.plan.buySymbol} launch needs a one-time approval. Larper sends it, waits
+                for it to land, then launches.
+              </span>
+            </div>
+          ) : null}
           <div className="mt-3 text-[12px] text-[var(--muted-dim)]">
             Estimated at the config's opening price. A fresh launch has no pool yet, so this is a
             deterministic quote, not a market read.

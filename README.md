@@ -81,14 +81,30 @@ Only switch to **Live** once you trust it.
 The **Launch** screen creates a token and buys it in one transaction via pons's `launchAndBuy`
 router. Nothing can trade in between, so the opening buy can't be front-run.
 
-- Fill in the token (name, symbol, description, logo, socials), pick a launch config, set the
-  first-buy amount in ETH, and choose which wallet signs.
-- **Preview** computes the plan without sending anything: total cost (launch fee + buy), expected
-  tokens, min-out after slippage, and how many wallets will be exempt.
+- Fill in the token (name, symbol, description, logo, socials), pick a launch config, choose the
+  **pair asset** (Native ETH or USDG), set the first-buy amount, and choose which wallet signs.
+- **Preview** computes the plan without sending anything: launch fee, first buy, expected tokens,
+  min-out after slippage, and how many wallets will be exempt.
 - **Launch atomically** sends the real transaction. It's only enabled when the console is in
   **Live** mode, and it asks for confirmation.
 - The screen shows whether the signing wallet is currently allowed to launch (`canLaunch`); pons
   can gate public launches on and off.
+
+### ETH vs USDG pairing
+
+The curve is **single-currency**: a USDG-paired launch only accepts USDG, and its economics are
+recorded per asset (`pairTokenEconomics`), so the buy amount is in USDG units (6 decimals) — not
+wei. Larper handles both:
+
+| | Native ETH | USDG |
+| --- | --- | --- |
+| Buy amount | `buyAmountEth` (18 dp) | `buyAmountQuote` (6 dp) |
+| Quote uses | config phantom/threshold (ETH) | `pairTokenEconomics(USDG)` |
+| `value` sent | launch fee **+** buy | launch fee only |
+| Approval | none | **one-time** `approve(launchAndBuy, max)` first |
+
+The approval is the only non-atomic step, and only on the first pair launch: Larper sends it, waits
+for it to land, then runs `launchAndBuy`. ETH launches stay a single transaction.
 
 > A brand-new launch has no pool yet, so the quote is computed deterministically from the launch
 > config's opening price (phantom reserve), not from a market read.
