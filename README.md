@@ -106,6 +106,20 @@ wei. Larper handles both:
 The approval is the only non-atomic step, and only on the first pair launch: Larper sends it, waits
 for it to land, then runs `launchAndBuy`. ETH launches stay a single transaction.
 
+### Pre-armed buys (the launch block)
+
+Because Larper knows the launch salt, it can **simulate `launchAndBuy` before sending** and learn
+the exact token and curve addresses. It then pre-signs every *other* enabled buying wallet's buy
+and submits them immediately behind the launch — so they can land in the **launch block** instead
+of the next one.
+
+- Toggle: **Pre-arm buying wallets** on the Launch screen (on by default).
+- Buyers are priced against the simulated curve *after* your atomic buy, so `minTokensOut` is
+  realistic rather than optimistic.
+- If a pre-signed buy is ordered before the launch, it simply reverts (**gas only**, no position
+  lost). The watcher remains the fallback if pre-arming can't simulate.
+- The signing wallet is excluded (it already buys atomically in the launch transaction).
+
 > A brand-new launch has no pool yet, so the quote is computed deterministically from the launch
 > config's opening price (phantom reserve), not from a market read.
 
@@ -208,6 +222,19 @@ Shared work is now done **once per launch**, and only the genuinely per-wallet r
 
 The block fetch is the heavy one (`eth_getBlockByNumber` returns every tx hash in the block), and
 it used to run once per wallet.
+
+### The buy path is now two round trips
+
+Everything the send needs — curve, snipe tax, gas/fees, **each wallet's balance and nonce** — is
+fetched in one batch, then the signed transaction is broadcast:
+
+```
+[1 read hop] → sign (local, ~ms) → [1 broadcast hop]
+```
+
+That replaced `reads → balance → nonce → broadcast` (4 hops). Measured on a live curve:
+**2,249ms → 392ms** median for the read phase, and it removes two of the four chances to hit an RPC
+stall (stalls of 0.9–5.7s have been observed on the free tier).
 
 ### The approve step (ERC-20 pairs, e.g. USDG)
 

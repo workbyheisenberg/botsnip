@@ -147,10 +147,53 @@ export function withSlippage(tokensOut: bigint, slippageBps: number): bigint {
 }
 
 /**
+ * The curve's opening state for a brand-new launch. The curve starts at
+ * (phantomQuote, supply) and holds back
+ * `supply * phantomQuote / (phantomQuote + threshold)` for the pool.
+ */
+export function freshCurveState(params: {
+  supply: bigint;
+  phantomQuote: bigint;
+  graduationThreshold: bigint;
+  curveFeeBps: bigint;
+  creatorTaxBps: bigint;
+}): CurveState {
+  const { supply, phantomQuote, graduationThreshold, curveFeeBps, creatorTaxBps } = params;
+  const reserved = (supply * phantomQuote) / (phantomQuote + graduationThreshold);
+  return {
+    isNativeQuote: true,
+    pairToken: "0x0000000000000000000000000000000000000000",
+    quoteReserve: phantomQuote,
+    tokenReserve: supply,
+    sellable: supply - reserved,
+    feeBps: curveFeeBps,
+    creatorTaxBps,
+    snipeTaxBps: 0n,
+    graduated: false,
+    readyToGraduate: false,
+  };
+}
+
+/**
+ * Advance a curve state by a buy that settled. Used to chain quotes so a
+ * later buyer in the same block is priced against the earlier buys instead of
+ * against the opening state.
+ */
+export function applyBuyToState(state: CurveState, spent: bigint, tokensOut: bigint): CurveState {
+  const fee = (spent * state.feeBps) / BPS;
+  const tax = (spent * state.creatorTaxBps) / BPS;
+  const snipe = (spent * state.snipeTaxBps) / BPS;
+  const net = spent - fee - tax - snipe;
+  return {
+    ...state,
+    quoteReserve: state.quoteReserve + net,
+    tokenReserve: state.tokenReserve - tokensOut,
+    sellable: state.sellable > tokensOut ? state.sellable - tokensOut : 0n,
+  };
+}
+
+/**
  * Quote the first buy of a brand-new launch, before its curve exists.
- * The curve starts at (phantomQuote, supply) and holds back
- * `supply * phantomQuote / (phantomQuote + threshold)` for the pool, so
- * `sellable = supply - reserved`.
  */
 export function quoteFreshLaunch(params: {
   supply: bigint;
@@ -160,24 +203,8 @@ export function quoteFreshLaunch(params: {
   creatorTaxBps: bigint;
   quoteIn: bigint;
 }): BuyQuote & { sellable: bigint } {
-  const { supply, phantomQuote, graduationThreshold, curveFeeBps, creatorTaxBps, quoteIn } = params;
-  const reserved = (supply * phantomQuote) / (phantomQuote + graduationThreshold);
-  const sellable = supply - reserved;
-
-  const state: CurveState = {
-    isNativeQuote: true,
-    pairToken: "0x0000000000000000000000000000000000000000",
-    quoteReserve: phantomQuote,
-    tokenReserve: supply,
-    sellable,
-    feeBps: curveFeeBps,
-    creatorTaxBps,
-    snipeTaxBps: 0n,
-    graduated: false,
-    readyToGraduate: false,
-  };
-
-  return { ...quoteCurveBuy(quoteIn, state), sellable };
+  const state = freshCurveState(params);
+  return { ...quoteCurveBuy(params.quoteIn, state), sellable: state.sellable };
 }
 
 export { BPS };

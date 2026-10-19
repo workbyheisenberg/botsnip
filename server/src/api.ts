@@ -307,6 +307,7 @@ const launchSchema = z.object({
   creatorFeeRecipient: z.string().optional(),
   signerWalletId: z.string().min(1),
   extraExemptions: z.array(z.string()).max(32).optional(),
+  preArmBuyers: z.boolean().optional(),
   dryRun: z.boolean(),
 });
 

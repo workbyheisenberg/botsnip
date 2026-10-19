@@ -1,4 +1,4 @@
-import { formatEther, formatUnits, parseUnits, type Address } from "viem";
+import { formatEther, formatUnits, parseUnits, zeroAddress, type Address } from "viem";
 import {
   curveAbi,
   erc20Abi,
@@ -33,6 +33,21 @@ export interface LaunchEvent {
 }
 
 const inFlight = new Set<string>();
+
+/**
+ * Nonces we've already handed out this session. The shared batch reads the
+ * chain's pending nonce, but if two launches arrive back-to-back we must not
+ * reuse one — so we layer our own counter on top of the chain value.
+ */
+const localNonce = new Map<string, number>();
+
+function reserveNonce(address: string, chainNonce: number, count: number): number {
+  const key = address.toLowerCase();
+  const local = localNonce.get(key);
+  const start = local !== undefined && local > chainNonce ? local : chainNonce;
+  localNonce.set(key, start + count);
+  return start;
+}
 
 /**
  * Reacts to a launch event: if the deployer is one of our watched wallets,
@@ -138,27 +153,51 @@ async function reaction(
   });
 
   // ── Shared work, done ONCE regardless of wallet count ────────────────────
-  // Reading the curve and the fee/priority settings does not depend on which
-  // wallet is buying. Doing it per wallet is what made extra wallets slow:
-  // 3 wallets meant 3x the RPC calls and 3 block fetches on the same path.
+  // Everything the send path needs is fetched in the SAME tick: curve, snipe
+  // tax, gas/fees, each wallet's balance AND each wallet's nonce. viem merges
+  // them into one HTTP request, so the buy path is then:
+  //     [1 read hop] → sign (local) → [1 broadcast hop]
+  // instead of the old reads → balance → nonce → broadcast (4 round trips).
+  const walletAddrs = buyers.map((b) => b.address as Address);
+  const nativeQuote = event.pairToken.toLowerCase() === zeroAddress;
 
-  // Fire the curve read, every wallet's snipe-tax read, AND the gas/fee read
-  // in the same tick. viem batches all of them into ONE HTTP request
-  // (8 + N calls), so wallet count no longer multiplies the critical path.
   let core: CurveCore;
   let taxes: bigint[];
   let overrides: GasOverrides;
+  let balances: bigint[];
+  let nonces: number[];
   try {
-    const [c, t, ov] = await Promise.all([
+    const [c, t, ov, bal, non] = await Promise.all([
       readCurveCore(publicClient, event.curve),
-      Promise.all(buyers.map((b) => readSnipeTax(publicClient, event.curve, b.address as Address))),
+      Promise.all(walletAddrs.map((a) => readSnipeTax(publicClient, event.curve, a))),
       settings.mode === "live"
         ? gasOverrides().catch(() => ({}) as GasOverrides)
         : Promise.resolve({} as GasOverrides),
+      Promise.all(
+        walletAddrs.map((a) =>
+          nativeQuote
+            ? publicClient.getBalance({ address: a })
+            : (publicClient.readContract({
+                address: event.pairToken,
+                abi: erc20Abi,
+                functionName: "balanceOf",
+                args: [a],
+              }) as Promise<bigint>),
+        ),
+      ),
+      settings.mode === "live"
+        ? Promise.all(
+            walletAddrs.map((a) =>
+              publicClient.getTransactionCount({ address: a, blockTag: "pending" }),
+            ),
+          )
+        : Promise.resolve(walletAddrs.map(() => 0)),
     ]);
     core = c;
     taxes = t;
     overrides = ov;
+    balances = bal;
+    nonces = non;
   } catch (err) {
     pushActivity({
       kind: "error",
@@ -176,16 +215,22 @@ async function reaction(
   // Polling inside each wallet multiplied the reads and stretched the exit.
   const limit = BigInt(settings.maxSnipeTaxBps);
   if (settings.mode === "live" && taxes.some((t) => t > limit)) {
-    taxes = await waitForSnipeTax(
-      event.curve,
-      buyers.map((b) => b.address as Address),
-      limit,
-    );
+    taxes = await waitForSnipeTax(event.curve, walletAddrs, limit);
   }
 
   await Promise.allSettled(
     buyers.map((buyer, i) =>
-      buyOne(event, symbol, buyer, settings, core, overrides, taxes[i] ?? 0n),
+      buyOne(
+        event,
+        symbol,
+        buyer,
+        settings,
+        core,
+        overrides,
+        taxes[i] ?? 0n,
+        balances[i] ?? 0n,
+        nonces[i] ?? 0,
+      ),
     ),
   );
 }
@@ -223,6 +268,8 @@ async function buyOne(
   core: CurveCore,
   overrides: GasOverrides,
   snipeTaxBps: bigint,
+  prefetchedBalance: bigint,
+  prefetchedNonce: number,
 ): Promise<void> {
   const db = getDB();
   const recipient = buyer.address as Address;
@@ -325,7 +372,19 @@ async function buyOne(
     return;
   }
 
-  await sendBuy(event, symbol, buyer, state, spend, decimals, assetLabel, minOut, overrides);
+  await sendBuy(
+    event,
+    symbol,
+    buyer,
+    state,
+    spend,
+    decimals,
+    assetLabel,
+    minOut,
+    overrides,
+    prefetchedBalance,
+    prefetchedNonce,
+  );
 }
 
 async function sendBuy(
@@ -338,6 +397,8 @@ async function sendBuy(
   assetLabel: string,
   minOut: bigint,
   overrides: GasOverrides,
+  prefetchedBalance: bigint,
+  prefetchedNonce: number,
 ): Promise<void> {
   const who = buyer.label || shortAddr(buyer.address);
   const recipient = buyer.address as Address;
@@ -345,29 +406,35 @@ async function sendBuy(
   try {
     const privateKey = decryptSecret(buyer.encryptedKey) as `0x${string}`;
     const { wallet } = makeWalletClient(privateKey);
+    const account = wallet.account!;
+
+    // Balance and nonce came from the shared batch — there are no reads left
+    // on this path, so the only remaining round trip is the broadcast itself.
+    if (prefetchedBalance < spend) {
+      pushActivity({
+        kind: "skip",
+        level: "warn",
+        title: `Buy skipped (${who}) — underfunded`,
+        detail: state.isNativeQuote
+          ? `Balance ${formatEther(prefetchedBalance)} ETH is less than the ${formatEther(spend)} ETH buy.`
+          : `Needs ${fmtAmount(spend, decimals)} ${assetLabel}, has ${fmtAmount(prefetchedBalance, decimals)}.`,
+        token: event.token,
+        tokenSymbol: symbol,
+      });
+      return;
+    }
 
     if (state.isNativeQuote) {
-      const balance = await publicClient.getBalance({ address: recipient });
-      if (balance < spend) {
-        pushActivity({
-          kind: "skip",
-          level: "warn",
-          title: `Buy skipped (${who}) — underfunded`,
-          detail: `Balance ${formatEther(balance)} ETH is less than the ${formatEther(spend)} ETH buy.`,
-          token: event.token,
-          tokenSymbol: symbol,
-        });
-        return;
-      }
-
+      const nonce = reserveNonce(recipient, prefetchedNonce, 1);
       const hash = await wallet.writeContract({
         address: event.curve,
         abi: curveAbi,
         functionName: "buy",
         args: [spend, minOut, recipient],
         value: spend,
+        nonce,
         ...overrides,
-        account: wallet.account!,
+        account,
         chain: wallet.chain,
       });
       reportBuy(event, symbol, who, spend, decimals, assetLabel, minOut, hash);
@@ -375,67 +442,48 @@ async function sendBuy(
     }
 
     // ── ERC-20 paired launch ──────────────────────────────────────────────
-    const balance = (await publicClient.readContract({
-      address: state.pairToken,
-      abi: erc20Abi,
-      functionName: "balanceOf",
-      args: [recipient],
-    })) as bigint;
-    if (balance < spend) {
-      pushActivity({
-        kind: "skip",
-        level: "warn",
-        title: `Buy skipped (${who}) — underfunded`,
-        detail: `Needs ${fmtAmount(spend, decimals)} ${assetLabel}, has ${fmtAmount(balance, decimals)}.`,
-        token: event.token,
-        tokenSymbol: symbol,
-      });
-      return;
-    }
+    // Approval is per-curve, and this curve was created seconds ago, so its
+    // allowance is provably zero — no read needed. Send approve and buy
+    // together with sequential nonces instead of awaiting the approve.
+    const nonce = reserveNonce(recipient, prefetchedNonce, 2);
 
-    // Approval is per-curve, and this curve was created seconds ago by the
-    // launch we just detected — so its allowance for this wallet is provably
-    // zero. Reading `allowance` costs a full RPC round-trip on the critical
-    // path for a value we already know, so we skip it and always approve.
-    const nonce = await publicClient.getTransactionCount({
-      address: recipient,
-      blockTag: "pending",
-    });
-
-    const approveHash = await wallet.writeContract({
-      address: state.pairToken,
-      abi: erc20Abi,
-      functionName: "approve",
-      args: [event.curve, spend],
-      nonce,
-      ...overrides,
-      account: wallet.account!,
-      chain: wallet.chain,
-    });
+    const [approveHash, hash] = await Promise.all([
+      wallet.writeContract({
+        address: state.pairToken,
+        abi: erc20Abi,
+        functionName: "approve",
+        args: [event.curve, spend],
+        nonce,
+        ...overrides,
+        account,
+        chain: wallet.chain,
+      }),
+      wallet.writeContract({
+        address: event.curve,
+        abi: curveAbi,
+        functionName: "buy",
+        args: [spend, minOut, recipient],
+        nonce: nonce + 1,
+        ...overrides,
+        account,
+        chain: wallet.chain,
+      }),
+    ]);
 
     pushActivity({
       kind: "info",
       level: "info",
       title: `Approving ${assetLabel} (${who})`,
-      detail: `Approve sent (${approveHash.slice(0, 10)}…) — buy follows immediately, no wait.`,
+      detail: `Approve sent (${approveHash.slice(0, 10)}…) — buy sent back-to-back, no wait.`,
       token: event.token,
       tokenSymbol: symbol,
       curve: event.curve,
       txHash: approveHash,
     });
 
-    const hash = await wallet.writeContract({
-      address: event.curve,
-      abi: curveAbi,
-      functionName: "buy",
-      args: [spend, minOut, recipient],
-      nonce: nonce + 1,
-      ...overrides,
-      account: wallet.account!,
-      chain: wallet.chain,
-    });
     reportBuy(event, symbol, who, spend, decimals, assetLabel, minOut, hash);
   } catch (err) {
+    localNonce.delete(recipient.toLowerCase());
     pushActivity({
       kind: "error",
       level: "error",

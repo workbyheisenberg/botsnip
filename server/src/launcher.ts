@@ -1,8 +1,10 @@
 import { randomBytes } from "node:crypto";
-import { formatEther, formatUnits, maxUint256, parseEventLogs, parseUnits, toHex, zeroAddress, type Address } from "viem";
+import { encodeFunctionData, formatEther, formatUnits, maxUint256, parseEventLogs, parseUnits, toHex, zeroAddress, type Address } from "viem";
 import {
+  curveAbi,
   erc20Abi,
   factoryAbi,
+  gasOverrides,
   launchAndBuyAbi,
   makeWalletClient,
   PONS,
@@ -11,7 +13,13 @@ import {
 } from "./chain.js";
 import { decryptSecret } from "./crypto.js";
 import { getDB, pushActivity, saveDB } from "./store.js";
-import { quoteFreshLaunch, withSlippage } from "./quote.js";
+import {
+  applyBuyToState,
+  freshCurveState,
+  quoteCurveBuy,
+  quoteFreshLaunch,
+  withSlippage,
+} from "./quote.js";
 import { isAddressLike, shortAddr } from "./util.js";
 
 export interface LaunchConfigView {
@@ -124,6 +132,8 @@ export interface LaunchInput {
   creatorFeeRecipient?: string;
   signerWalletId: string;
   extraExemptions?: string[];
+  /** Pre-sign the other buying wallets' buys so they can land in the launch block. */
+  preArmBuyers?: boolean;
   dryRun: boolean;
 }
 
@@ -143,6 +153,8 @@ export interface LaunchResult {
     pairToken: string;
     /** True when a pair launch still needs an ERC-20 approval before it can run. */
     needsApproval: boolean;
+    /** How many other buying wallets are pre-armed for the launch block. */
+    prearmedBuyers: number;
   };
   txHash?: string;
   token?: string;
@@ -320,6 +332,12 @@ export async function executeLaunch(input: LaunchInput): Promise<LaunchResult> {
 
   const value = native ? launchFee + quoteIn : launchFee;
 
+  // The signer already buys atomically; these are the *other* wallets we can
+  // pre-sign so their buys can land in the launch block too.
+  const prearmableBuyers = db.buying.filter(
+    (b) => b.enabled && b.encryptedKey && b.id !== signer.id,
+  ).length;
+
   const plan = {
     totalCostEth: formatEther(value),
     launchFeeEth: formatEther(launchFee),
@@ -331,6 +349,7 @@ export async function executeLaunch(input: LaunchInput): Promise<LaunchResult> {
     exemptions,
     pairToken,
     needsApproval,
+    prearmedBuyers: input.preArmBuyers === false ? 0 : prearmableBuyers,
   };
 
   if (input.dryRun) {
@@ -382,6 +401,135 @@ export async function executeLaunch(input: LaunchInput): Promise<LaunchResult> {
       await publicClient.waitForTransactionReceipt({ hash: approveHash, timeout: 90_000 });
     }
 
+    // ── Pre-arm the other buyers for the launch block ──────────────────────
+    // We know the salt, so simulating launchAndBuy reveals the exact token and
+    // curve addresses. That lets us pre-sign every other buyer's buy BEFORE the
+    // launch is sent, then submit them immediately behind it. If the sequencer
+    // orders them after the launch they land in the launch block; if one is
+    // ordered before it, it simply reverts (gas only).
+    const preArmed: Array<{ label: string; raw: `0x${string}` }> = [];
+    if (input.preArmBuyers !== false) {
+      try {
+        const preview = await publicClient.simulateContract({
+          address: PONS.launchAndBuy,
+          abi: launchAndBuyAbi,
+          functionName: "launchAndBuy",
+          args: [params, BigInt(configId), pairToken, quoteIn, minOut, recipient, exemptions],
+          value,
+          account: wallet.account!,
+        });
+        const predictedCurve = (preview.result as readonly [Address, Address, bigint])[1];
+
+        // Price the buyers against the curve AFTER our own atomic buy.
+        let simState = freshCurveState({
+          supply: config.supply,
+          phantomQuote,
+          graduationThreshold,
+          curveFeeBps: config.curveFeeBps,
+          creatorTaxBps: BigInt(creatorTaxBps),
+        });
+        if (quoteIn > 0n) {
+          const atomic = quoteCurveBuy(quoteIn, simState);
+          simState = applyBuyToState(simState, atomic.spent, atomic.tokensOut);
+        }
+
+        // A pre-signed tx cannot ask the node for gas/fees later, so pin them.
+        const gasOv = await gasOverrides();
+        const gas = gasOv.gas ?? 400_000n;
+        let maxFee = gasOv.maxFeePerGas;
+        let maxPrio = gasOv.maxPriorityFeePerGas;
+        if (!maxFee) {
+          const est = await publicClient.estimateFeesPerGas();
+          maxFee = est.maxFeePerGas;
+          maxPrio = est.maxPriorityFeePerGas ?? maxPrio;
+        }
+
+        const armed = db.buying.filter(
+          (b) => b.enabled && b.encryptedKey && b.id !== signer.id,
+        );
+        const prepared = armed.map((b) => ({
+          buyer: b,
+          ...makeWalletClient(decryptSecret(b.encryptedKey) as `0x${string}`),
+        }));
+        const armedNonces = await Promise.all(
+          prepared.map((p) =>
+            publicClient.getTransactionCount({ address: p.account.address, blockTag: "pending" }),
+          ),
+        );
+
+        for (let i = 0; i < prepared.length; i += 1) {
+          const { buyer: b, wallet: bw, account: bacc } = prepared[i];
+          const spend = native
+            ? parseUnits((b.amountEth || "").trim() || "0", 18)
+            : parseUnits((b.amountQuote || "").trim() || "0", quoteDecimals);
+          if (spend <= 0n) continue;
+
+          const q = quoteCurveBuy(spend, simState);
+          if (q.tokensOut <= 0n) continue;
+          const buyerMinOut = withSlippage(q.tokensOut, db.settings.slippageBps);
+
+          let n = armedNonces[i] ?? 0;
+          if (!native) {
+            const approveTx = await bw.prepareTransactionRequest({
+              to: pairToken,
+              data: encodeFunctionData({
+                abi: erc20Abi,
+                functionName: "approve",
+                args: [predictedCurve, spend],
+              }),
+              nonce: n,
+              gas,
+              maxFeePerGas: maxFee,
+              maxPriorityFeePerGas: maxPrio,
+              account: bacc,
+              chain: bw.chain,
+            });
+            preArmed.push({
+              label: `${b.label} approve`,
+              raw: await bacc.signTransaction(approveTx),
+            });
+            n += 1;
+          }
+
+          const buyTx = await bw.prepareTransactionRequest({
+            to: predictedCurve,
+            data: encodeFunctionData({
+              abi: curveAbi,
+              functionName: "buy",
+              args: [spend, buyerMinOut, bacc.address],
+            }),
+            value: native ? spend : 0n,
+            nonce: n,
+            gas,
+            maxFeePerGas: maxFee,
+            maxPriorityFeePerGas: maxPrio,
+            account: bacc,
+            chain: bw.chain,
+          });
+          preArmed.push({ label: b.label, raw: await bacc.signTransaction(buyTx) });
+
+          // Move the simulated curve forward so the next buyer is priced fairly.
+          simState = applyBuyToState(simState, q.spent, q.tokensOut);
+        }
+
+        if (preArmed.length > 0) {
+          pushActivity({
+            kind: "info",
+            level: "info",
+            title: `Pre-armed ${preArmed.length} buy(s) for the launch block`,
+            detail: `${preArmed.map((p) => p.label).join(", ")} · curve ${shortAddr(predictedCurve, 5)}`,
+          });
+        }
+      } catch (err) {
+        pushActivity({
+          kind: "info",
+          level: "warn",
+          title: "Pre-arming skipped",
+          detail: `${err instanceof Error ? err.message.split("\n")[0] : String(err)} — the watcher will still buy.`,
+        });
+      }
+    }
+
     const hash = await wallet.writeContract({
       address: PONS.launchAndBuy,
       abi: launchAndBuyAbi,
@@ -391,6 +539,21 @@ export async function executeLaunch(input: LaunchInput): Promise<LaunchResult> {
       account: wallet.account!,
       chain: wallet.chain,
     });
+
+    // Submit the pre-armed buys immediately behind the launch.
+    if (preArmed.length > 0) {
+      const sent = await Promise.allSettled(
+        preArmed.map((p) => publicClient.sendRawTransaction({ serializedTransaction: p.raw })),
+      );
+      const ok = sent.filter((r) => r.status === "fulfilled").length;
+      pushActivity({
+        kind: "info",
+        level: ok === sent.length ? "success" : "warn",
+        title: `Launch-block buys submitted — ${ok}/${sent.length}`,
+        detail: `${preArmed.map((p) => p.label).join(", ")} · launch ${hash.slice(0, 10)}…`,
+        txHash: hash,
+      });
+    }
 
     pushActivity({
       kind: "info",

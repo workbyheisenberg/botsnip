@@ -100,6 +100,7 @@ export interface LaunchPlan {
   exemptions: string[];
   pairToken: string;
   needsApproval: boolean;
+  prearmedBuyers: number;
 }
 
 export interface LaunchResult {
@@ -126,6 +127,7 @@ export interface LaunchRequest {
   creatorFeeRecipient?: string;
   signerWalletId: string;
   extraExemptions?: string[];
+  preArmBuyers?: boolean;
   dryRun: boolean;
 }
 

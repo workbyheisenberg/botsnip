@@ -36,6 +36,7 @@ export function LaunchPage() {
   const [creatorTaxBps, setCreatorTaxBps] = useState(0);
   const [buybackEnabled, setBuybackEnabled] = useState(true);
   const [signerWalletId, setSignerWalletId] = useState("");
+  const [preArmBuyers, setPreArmBuyers] = useState(true);
 
   const [plan, setPlan] = useState<LaunchResult | null>(null);
   const [busy, setBusy] = useState(false);
@@ -75,6 +76,7 @@ export function LaunchPage() {
       creatorTaxBps,
       buybackEnabled,
       signerWalletId,
+      preArmBuyers,
       dryRun,
     };
   }
@@ -303,6 +305,17 @@ export function LaunchPage() {
             )}
           </div>
 
+          <div className="flex items-center gap-3">
+            <div className="min-w-0 flex-1">
+              <div className="text-[14px] font-semibold">Pre-arm buying wallets</div>
+              <div className="text-[12.5px] text-[var(--muted-dim)]">
+                Pre-signs the other wallets' buys and fires them right behind the launch, so they
+                can land in the launch block.
+              </div>
+            </div>
+            <Toggle on={preArmBuyers} onChange={setPreArmBuyers} />
+          </div>
+
           {!live ? (
             <div className="inset flex items-start gap-2 p-3.5 text-[12.5px] text-[var(--warn)]">
               <TriangleAlert size={15} className="mt-0.5 flex-none" />
@@ -345,6 +358,8 @@ export function LaunchPage() {
             <PlanRow label="Recipient" value={shortAddr(plan.plan.recipient, 5)} mono />
             <Row />
             <PlanRow label="Exempt wallets" value={String(plan.plan.exemptions.length)} />
+            <Row />
+            <PlanRow label="Pre-armed buyers" value={String(plan.plan.prearmedBuyers)} />
           </div>
           {plan.plan.needsApproval ? (
             <div className="mt-3 flex items-start gap-2 text-[12px] text-[var(--warn)]">
