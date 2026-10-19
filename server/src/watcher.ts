@@ -69,6 +69,21 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export async function startWatcher(): Promise<void> {
   if (health.running) return;
+
+  // Nothing to watch? Don't open a socket at all. With pre-armed buys on the
+  // Launch screen a launch needs no watcher, so an empty watch list means the
+  // watcher should cost exactly zero RPC/WebSocket traffic.
+  const watching =
+    getDB().watched.some((w) => w.enabled) || getDB().settings.watchAllLaunches;
+  if (!watching) {
+    health.running = false;
+    health.connected = false;
+    health.transport = "idle";
+    health.logsPush = false;
+    health.lastError = null;
+    return;
+  }
+
   stopRequested = false;
   health.running = true;
 

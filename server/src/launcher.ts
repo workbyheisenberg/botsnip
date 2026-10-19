@@ -12,6 +12,7 @@ import {
   tokenLaunchedEvent,
 } from "./chain.js";
 import { decryptSecret } from "./crypto.js";
+import { markPrearmed } from "./launchRegistry.js";
 import { getDB, pushActivity, saveDB } from "./store.js";
 import {
   applyBuyToState,
@@ -408,6 +409,7 @@ export async function executeLaunch(input: LaunchInput): Promise<LaunchResult> {
     // orders them after the launch they land in the launch block; if one is
     // ordered before it, it simply reverts (gas only).
     const preArmed: Array<{ label: string; raw: `0x${string}` }> = [];
+    let predictedToken: Address | undefined;
     if (input.preArmBuyers !== false) {
       try {
         const preview = await publicClient.simulateContract({
@@ -418,7 +420,12 @@ export async function executeLaunch(input: LaunchInput): Promise<LaunchResult> {
           value,
           account: wallet.account!,
         });
-        const predictedCurve = (preview.result as readonly [Address, Address, bigint])[1];
+        const [predictedTokenValue, predictedCurve] = preview.result as readonly [
+          Address,
+          Address,
+          bigint,
+        ];
+        predictedToken = predictedTokenValue;
 
         // Price the buyers against the curve AFTER our own atomic buy.
         let simState = freshCurveState({
@@ -525,7 +532,7 @@ export async function executeLaunch(input: LaunchInput): Promise<LaunchResult> {
           kind: "info",
           level: "warn",
           title: "Pre-arming skipped",
-          detail: `${err instanceof Error ? err.message.split("\n")[0] : String(err)} — the watcher will still buy.`,
+          detail: `${err instanceof Error ? err.message.split("\n")[0] : String(err)} — the watcher will still buy if the launch wallet is watched.`,
         });
       }
     }
@@ -546,6 +553,10 @@ export async function executeLaunch(input: LaunchInput): Promise<LaunchResult> {
         preArmed.map((p) => publicClient.sendRawTransaction({ serializedTransaction: p.raw })),
       );
       const ok = sent.filter((r) => r.status === "fulfilled").length;
+
+      // Tell the watcher not to buy this launch again when the event arrives.
+      if (ok > 0 && predictedToken) markPrearmed(predictedToken);
+
       pushActivity({
         kind: "info",
         level: ok === sent.length ? "success" : "warn",

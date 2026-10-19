@@ -9,6 +9,7 @@ import {
   type GasOverrides,
 } from "./chain.js";
 import { decryptSecret } from "./crypto.js";
+import { wasPrearmed } from "./launchRegistry.js";
 import { getDB, pushActivity, saveDB } from "./store.js";
 import {
   quoteCurveBuy,
@@ -93,6 +94,21 @@ export async function handleLaunch(
     curve: event.curve,
     txHash: event.txHash,
   });
+
+  // Larper already pre-armed this launch's buys from the Launch screen, so the
+  // watcher must not buy a second time when the same event arrives.
+  if (wasPrearmed(event.token)) {
+    pushActivity({
+      kind: "info",
+      level: "info",
+      title: "Skipped — already covered by pre-armed buys",
+      detail: `${label} · no second buy`,
+      token: event.token,
+      tokenSymbol: symbol,
+      curve: event.curve,
+    });
+    return;
+  }
 
   // Watch-all is monitoring/notifications only — never trade on arbitrary launches.
   if (!watched) return;
