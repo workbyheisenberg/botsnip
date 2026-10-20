@@ -371,7 +371,8 @@ export async function executeLaunch(input: LaunchInput): Promise<LaunchResult> {
     },
     creatorFeeRecipient: recipient,
     creatorTaxBps,
-    buybackEnabled: Boolean(input.buybackEnabled),
+    // Hard-disabled: this team never uses buybacks. The API field is ignored.
+    buybackEnabled: false,
     expectedEconomics: expectedEconomics as `0x${string}`,
     salt: toHex(randomBytes(32)),
   };

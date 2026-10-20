@@ -34,7 +34,6 @@ export function LaunchPage() {
   const [buyAmountEth, setBuyAmountEth] = useState(state?.settings.buyAmountEth ?? "0.02");
   const [buyAmountQuote, setBuyAmountQuote] = useState("1");
   const [creatorTaxBps, setCreatorTaxBps] = useState(0);
-  const [buybackEnabled, setBuybackEnabled] = useState(true);
   const [signerWalletId, setSignerWalletId] = useState("");
   const [preArmBuyers, setPreArmBuyers] = useState(true);
 
@@ -74,7 +73,7 @@ export function LaunchPage() {
       buyAmountEth,
       buyAmountQuote,
       creatorTaxBps,
-      buybackEnabled,
+      buybackEnabled: false,
       signerWalletId,
       preArmBuyers,
       dryRun,
@@ -286,10 +285,12 @@ export function LaunchPage() {
 
           <div className="flex items-center gap-3">
             <div className="min-w-0 flex-1">
-              <div className="text-[14px] font-semibold">Enable buybacks</div>
-              <div className="text-[12.5px] text-[var(--muted-dim)]">Optional creator buyback, funded from creator fees</div>
+              <div className="text-[14px] font-semibold">Buybacks</div>
+              <div className="text-[12.5px] text-[var(--muted-dim)]">
+                Always disabled. Creator fees are never spent buying back supply.
+              </div>
             </div>
-            <Toggle on={buybackEnabled} onChange={setBuybackEnabled} />
+            <Pill tone="muted">Off</Pill>
           </div>
 
           <div className="inset p-3.5 text-[12.5px] leading-relaxed text-[var(--muted)]">
