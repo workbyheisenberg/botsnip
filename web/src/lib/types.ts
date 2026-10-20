@@ -136,6 +136,7 @@ export interface StatusInfo {
   pons: { factory: string; launchAndBuy: string };
   watcher: {
     running: boolean;
+    watching: boolean;
     connected: boolean;
     transport: "websocket" | "polling" | "idle";
     logsPush: boolean;

@@ -17,6 +17,8 @@ type TransportKind = "websocket" | "polling" | "idle";
 
 interface Health {
   running: boolean;
+  /** True when there is something to watch (a watched wallet or watch-all). */
+  watching: boolean;
   connected: boolean;
   transport: TransportKind;
   /** True when launches arrive via a filtered push stream (best case). */
@@ -34,6 +36,7 @@ interface Health {
 
 const health: Health = {
   running: false,
+  watching: false,
   connected: false,
   transport: "idle",
   logsPush: false,
@@ -77,6 +80,7 @@ export async function startWatcher(): Promise<void> {
     getDB().watched.some((w) => w.enabled) || getDB().settings.watchAllLaunches;
   if (!watching) {
     health.running = false;
+    health.watching = false;
     health.connected = false;
     health.transport = "idle";
     health.logsPush = false;
@@ -86,6 +90,7 @@ export async function startWatcher(): Promise<void> {
 
   stopRequested = false;
   health.running = true;
+  health.watching = true;
 
   rebuildClients();
   await ensureBatchSupport();

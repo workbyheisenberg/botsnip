@@ -41,7 +41,11 @@ export function Layout() {
   const { state, status } = useStore();
   const live = state?.settings.mode === "live";
   const armed = state?.settings.autoBuyEnabled;
-  const connected = status?.watcher.connected;
+  const connected = status?.watcher.connected ?? false;
+  // The watcher is intentionally idle when there is no watch list — that is
+  // not an outage. RPC health is a separate signal.
+  const watching = status?.watcher.watching !== false;
+  const rpcUp = status?.chain.connectedChainId === 4663;
 
   return (
     <div className="relative min-h-screen">
@@ -78,15 +82,27 @@ export function Layout() {
                 <span
                   className={clsx(
                     "dot",
-                    !connected ? "dot-error" : armed && live ? "dot-success pulse" : "dot-warn",
+                    !watching
+                      ? "dot-warn"
+                      : !connected
+                        ? "dot-error"
+                        : armed && live
+                          ? "dot-success pulse"
+                          : "dot-warn",
                   )}
                 />
                 <span className="text-[13px] font-semibold">
-                  {!connected ? "Disconnected" : armed && live ? "Live · armed" : "Idle"}
+                  {!watching
+                    ? "Watcher idle"
+                    : !connected
+                      ? "Disconnected"
+                      : armed && live
+                        ? "Live · armed"
+                        : "Idle"}
                 </span>
               </div>
               <div className="mt-2 text-[12px] leading-relaxed text-[var(--muted-dim)]">
-                {live ? "Live mode" : "Dry-run mode"} · block{" "}
+                {!watching ? "No watch list — use the Launch page" : live ? "Live mode" : "Dry-run mode"} · block{" "}
                 {status?.chain.head ? Number(status.chain.head).toLocaleString() : "—"}
               </div>
             </div>
@@ -104,9 +120,9 @@ export function Layout() {
               <div className="text-[13px] text-[var(--muted)]">pons · Robinhood Chain</div>
             </div>
             <div className="flex items-center gap-2">
-              <Pill tone={connected ? "brand" : "error"}>
-                <span className={clsx("dot", connected ? "dot-info" : "dot-error")} />
-                {connected ? "Connected" : "Offline"}
+              <Pill tone={rpcUp ? "brand" : "error"}>
+                <span className={clsx("dot", rpcUp ? "dot-info" : "dot-error")} />
+                {rpcUp ? "Connected" : "Offline"}
               </Pill>
               <Pill tone={live ? "error" : "muted"}>{live ? "LIVE" : "DRY RUN"}</Pill>
             </div>

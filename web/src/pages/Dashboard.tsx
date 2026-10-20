@@ -94,11 +94,12 @@ export function Dashboard() {
       sub: live ? "Real transactions will be sent" : "Safe — logs what it would do",
     },
     {
-      ok: status?.watcher.connected ?? false,
+      ok: status?.chain.connectedChainId === 4663,
       title: "Chain connection",
-      sub: status?.watcher.connected
-        ? `Block ${Number(status.watcher.head).toLocaleString()}`
-        : "Not connected to Robinhood Chain",
+      sub:
+        status?.chain.connectedChainId === 4663
+          ? `Block ${Number(status.chain.head ?? 0).toLocaleString()}`
+          : "Not connected to Robinhood Chain",
     },
   ];
 

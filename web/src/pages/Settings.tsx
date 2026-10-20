@@ -373,8 +373,20 @@ export function SettingsPage({ onLogout }: { onLogout: () => void }) {
           <ConnRow label="Chain" value="Robinhood Chain · 4663" />
           <ConnRow
             label="Status"
-            value={status?.watcher.connected ? "Connected" : "Disconnected"}
-            tone={status?.watcher.connected ? "success" : "error"}
+            value={
+              status?.watcher.watching === false
+                ? "Idle — no watch list"
+                : status?.watcher.connected
+                  ? "Connected"
+                  : "Disconnected"
+            }
+            tone={
+              status?.watcher.watching === false
+                ? undefined
+                : status?.watcher.connected
+                  ? "success"
+                  : "error"
+            }
           />
           <ConnRow label="Block" value={status?.chain.head ? Number(status.chain.head).toLocaleString() : "—"} />
           <ConnRow label="RPC" value={status?.chain.rpc ?? "—"} mono />
